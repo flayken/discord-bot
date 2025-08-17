@@ -2447,14 +2447,14 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not guild:
         return
 
-    # --- DAILIES PANEL HOOK (safe early exit if not a /dailies message) ---
+    # --- DAILIES PANEL HOOK (keep) ---
     try:
         await dailies_raw_reaction_add(payload)
     except Exception as e:
         log.warning(f"[dailies] reaction proxy error: {e}")
-    # ----------------------------------------------------------------------
+    # ---------------------------------
 
-    # ---------- BOUNTY (existing gate) ----------
+    # ---------- BOUNTY: gate (boxed + edits) ----------
     pend = pending_bounties.get(gid)
     if pend and payload.message_id == pend["message_id"] and _bounty_emoji_matches(payload.emoji):
         try:
@@ -2463,24 +2463,52 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             member = None
         if member and not member.bot and await is_worldler(guild, member):
             pend["users"].add(member.id)
-            if len(pend["users"]) >= 2:
-                channel_id = pend["channel_id"]
-                ch = guild.get_channel(channel_id)
+
+            # Build a neat player list
+            names = []
+            for uid in sorted(pend["users"]):
                 try:
-                    if isinstance(ch, discord.TextChannel):
-                        msg = await ch.fetch_message(pend["message_id"])
-                        names = []
-                        for uid in list(pend["users"])[:2]:
-                            m = guild.get_member(uid) or await guild.fetch_member(uid)
-                            names.append(m.mention if m else f"<@{uid}>")
-                        await msg.reply(f"✅ Bounty armed by {', '.join(names)}. Good luck!")
+                    m = guild.get_member(uid) or await guild.fetch_member(uid)
+                    names.append(m.mention if m else f"<@{uid}>")
+                except Exception:
+                    names.append(f"<@{uid}>")
+            players_txt = ", ".join(names) if names else "—"
+
+            # Edit the original gate card to show who’s in
+            try:
+                ch = guild.get_channel(pend["channel_id"])
+                if isinstance(ch, discord.TextChannel):
+                    msg = await ch.fetch_message(pend["message_id"])
+                    desc = (
+                        f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
+                        f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
+                        f"**Prize:** {BOUNTY_PAYOUT} {EMO_SHEKEL()}\n"
+                        "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+                        f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                    )
+                    emb = make_panel(
+                        title=f"{EMO_BOUNTY()} Hourly Bounty (GMT)",
+                        description=desc,
+                        fields=[("Players ready", players_txt, False)],
+                    )
+                    await msg.edit(embed=emb)
+            except Exception:
+                pass
+
+            # If we just reached 2 players, start the arming countdown (and box the notice)
+            if len(pend["users"]) >= 2 and not pend.get("arming_at"):
+                pend["arming_at"] = gmt_now_s() + BOUNTY_ARM_DELAY_S
+                try:
+                    ch = guild.get_channel(pend["channel_id"])
+                    await send_boxed(
+                        ch, "Bounty", f"✅ Armed by {', '.join(names[:2])}. **Arming in {BOUNTY_ARM_DELAY_S//60} minute…**",
+                        icon="🎯"
+                    )
                 except Exception:
                     pass
-                pending_bounties.pop(gid, None)
-                await _start_bounty_after_gate(guild, channel_id)
         return
 
-    # ---------- DUNGEON: join gate (EDIT the original gate embed) ----------
+    # ---------- DUNGEON: join gate (boxed + edits only) ----------
     gate = pending_dungeon_gates_by_msg.get(payload.message_id)
     if gate and _dungeon_join_emoji_matches(payload.emoji):
         try:
@@ -2488,76 +2516,65 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         except Exception:
             member = None
         if member and (not member.bot) and await is_worldler(guild, member):
+            # Track participant
             gate["participants"].add(member.id)
 
-            # Give the member access to the dungeon channel
+            # Grant write access to the dungeon channel
             dch = guild.get_channel(gate["dungeon_channel_id"])
             if isinstance(dch, discord.TextChannel):
                 try:
                     await dch.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
-                    g = dungeon_games.get(dch.id)
-                    if g:
-                        g["participants"].add(member.id)
-                    gmsg_id = g.get("welcome_msg_id") if g else None
-                    if gmsg_id:
-                        # Update the welcome message in the dungeon with the participant list
-                        try:
-                            msg = await dch.fetch_message(gmsg_id)
-                            names = []
-                            for uid in sorted(g["participants"]):
-                                try:
-                                    mm = guild.get_member(uid) or await guild.fetch_member(uid)
-                                    names.append(mm.mention if mm else f"<@{uid}>")
-                                except Exception:
-                                    names.append(f"<@{uid}>")
-                            # Rebuild a neat panel describing current participants
-                            emb = make_panel(
-                                title=f"Dungeon — Tier {g.get('tier')}",
-                                description="Gate is open. When ready, the **owner** clicks 🔒 to start.",
-                                fields=[("Participants", ", ".join(names) if names else "—", False)],
-                                icon="🌀",
-                            )
-                            await msg.edit(embed=emb)
-                        except Exception:
-                            pass
                 except Exception:
                     pass
+                # Mirror into the dungeon game object
+                g = dungeon_games.get(dch.id)
+                if g:
+                    g["participants"].add(member.id)
+                gmsg_id = g.get("welcome_msg_id") if g else None
+                if gmsg_id:
+                    # Edit the in-room welcome to show all participants (no new lines)
+                    try:
+                        msg = await dch.fetch_message(gmsg_id)
+                        names = []
+                        for uid in sorted(g["participants"]):
+                            try:
+                                mm = guild.get_member(uid) or await guild.fetch_member(uid)
+                                names.append(mm.mention if mm else f"<@{uid}>")
+                            except Exception:
+                                names.append(f"<@{uid}>")
+                        await msg.edit(content=(
+                            f"🌀 **Dungeon — Tier {g['tier']}**\n"
+                            f"Participants: {', '.join(names)}\n\n"
+                            "When ready, the **owner** clicks 🔒 to start."
+                        ))
+                    except Exception:
+                        pass
 
-            # EDIT the original gate message (in the gate channel) to include updated participants
+            # Edit the original *gate* message (where players click) to include the live roster
             try:
                 gate_ch = guild.get_channel(gate["gate_channel_id"])
                 if isinstance(gate_ch, discord.TextChannel):
-                    try:
-                        gate_msg = await gate_ch.fetch_message(payload.message_id)
-                        # Build updated participants field
-                        part_names = []
-                        for uid in sorted(gate["participants"]):
-                            try:
-                                mm = guild.get_member(uid) or await guild.fetch_member(uid)
-                                if mm.id == gate.get("owner_id"):
-                                    part_names.append(f"{mm.mention} (owner)")
-                                else:
-                                    part_names.append(mm.mention)
-                            except Exception:
-                                part_names.append(f"<@{uid}>")
-                        desc = (
-                            f"Click {EMO_DUNGEON()} below **to join**. You’ll gain write access in "
-                            f"{dch.mention if isinstance(dch, discord.TextChannel) else 'the dungeon room'}.\n"
-                            f"When ready, the **owner** will **lock** the dungeon from inside to start the game."
-                        )
-                        emb = make_panel(
-                            title=f"{EMO_DUNGEON()} Dungeon Gate (Tier {gate.get('tier')})",
-                            description=desc,
-                            fields=[("Participants", ", ".join(part_names) if part_names else "—", False)],
-                            icon="🌀",
-                        )
-                        await gate_msg.edit(embed=emb)
-                    except Exception:
-                        pass
+                    jmsg = await gate_ch.fetch_message(payload.message_id)
+                    names = []
+                    for uid in sorted(gate["participants"]):
+                        try:
+                            mm = guild.get_member(uid) or await guild.fetch_member(uid)
+                            names.append(mm.mention if mm else f"<@{uid}>")
+                        except Exception:
+                            names.append(f"<@{uid}>")
+                    emb = make_panel(
+                        title=f"{EMO_DUNGEON()} Dungeon Gate — Tier {gate['tier']}",
+                        description=(
+                            "Click the swirl below to **join**. "
+                            "When everyone’s in, the **owner** will lock the dungeon from inside to begin."
+                        ),
+                        fields=[("Participants", ", ".join(names) if names else "—", False)],
+                        icon="🌀",
+                    )
+                    # Switch to an embed (boxed); keep the reaction on the same message
+                    await jmsg.edit(content=None, embed=emb)
             except Exception:
                 pass
-
-        # (No extra “joined” messages—cleaner gate.)
         return
 
     # ---------- DUNGEON: owner locks 🔒 to start ----------
@@ -2570,9 +2587,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 pending_dungeon_gates_by_msg.pop(mid, None)
             ch = guild.get_channel(ch_id)
             if isinstance(ch, discord.TextChannel):
-                # In-room notice
                 await send_boxed(ch, "Dungeon", "🔒 **Gate closed.** No further joins. The dungeon begins!", icon="🌀")
-                # Public announcement
+                # public announcement
                 try:
                     await _announce_result(
                         guild,
@@ -2606,16 +2622,16 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 
 
+
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    """Opt-out: removing the 🎯 reaction before arming removes you from the pending pool."""
+    """Bounty opt-out: update the gate card (boxed) and cancel arming if we fall below 2."""
     gid = payload.guild_id
     if gid is None:
         return
+
     pend = pending_bounties.get(gid)
-    if not pend or payload.message_id != pend.get("message_id"):
-        return
-    if not _bounty_emoji_matches(payload.emoji):
+    if not pend or payload.message_id != pend.get("message_id") or not _bounty_emoji_matches(payload.emoji):
         return
 
     # Remove the user from the pending set (if present)
@@ -2623,40 +2639,48 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if uid and uid in pend.get("users", set()):
         pend["users"].discard(uid)
 
-        # NEW: if countdown was running but we dropped below 2, cancel it
-        if pend.get("arming_at") and len(pend["users"]) < 2:
-            pend["arming_at"] = None
-            try:
-                guild = discord.utils.get(bot.guilds, id=gid)
-                ch = guild.get_channel(pend["channel_id"])
-                if isinstance(ch, discord.TextChannel):
-                    try:
-                        msg = await ch.fetch_message(pend["message_id"])
-                        await msg.reply("⏹️ Bounty arming **cancelled** — need 2 players again.")
-                    except Exception:
-                        await ch.send("⏹️ Bounty arming **cancelled** — need 2 players again.")
-            except Exception:
-                pass
-
-        # Announce opt-out (existing behavior)
         guild = discord.utils.get(bot.guilds, id=gid)
         if not guild:
             return
+
+        # If countdown was running but we dropped below 2, cancel it (boxed)
+        if pend.get("arming_at") and len(pend["users"]) < 2:
+            pend["arming_at"] = None
+            try:
+                ch = guild.get_channel(pend["channel_id"])
+                await send_boxed(ch, "Bounty", "⏹️ Arming **cancelled** — need 2 players again.", icon="🎯")
+            except Exception:
+                pass
+
+        # Edit the original gate embed to reflect the new roster
         try:
             ch = guild.get_channel(pend["channel_id"])
             if isinstance(ch, discord.TextChannel):
-                try:
-                    member = guild.get_member(uid) or await guild.fetch_member(uid)
-                    name = member.mention if member else f"<@{uid}>"
-                except Exception:
-                    name = f"<@{uid}>"
-                try:
-                    msg = await ch.fetch_message(pend["message_id"])
-                    await msg.reply(f"🚪 {name} **opted out** of this bounty.")
-                except Exception:
-                    await ch.send(f"🚪 {name} **opted out** of this bounty.")
+                msg = await ch.fetch_message(pend["message_id"])
+                names = []
+                for id_ in sorted(pend["users"]):
+                    try:
+                        m = guild.get_member(id_) or await guild.fetch_member(id_)
+                        names.append(m.mention if m else f"<@{id_}>")
+                    except Exception:
+                        names.append(f"<@{id_}>")
+                players_txt = ", ".join(names) if names else "—"
+                desc = (
+                    f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
+                    f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
+                    f"**Prize:** {BOUNTY_PAYOUT} {EMO_SHEKEL()}\n"
+                    "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+                    f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                )
+                emb = make_panel(
+                    title=f"{EMO_BOUNTY()} Hourly Bounty (GMT)",
+                    description=desc,
+                    fields=[("Players ready", players_txt, False)],
+                )
+                await msg.edit(embed=emb)
         except Exception:
             pass
+
 
 
 # -------------------- DUNGEON emojis/helpers --------------------
