@@ -465,6 +465,122 @@ async def db_init():
 
 ##-------------------------------------HELPERS----------------------------------
 
+async def _get_owned_sellables(gid: int, uid: int) -> list[dict]:
+    """
+    Return a list of items the user can sell, each as:
+      { key, label, count, price_each, emoji }
+    Only include items with count > 0.
+    """
+    # Pull counts
+    stones   = await get_stones(gid, uid)
+    chickens = await get_chickens(gid, uid)
+    badge    = await get_badge(gid, uid)
+    sniper   = await get_sniper(gid, uid)
+    t3       = await get_dungeon_tickets_t3(gid, uid)
+
+    catalog = []
+    def _add(key: str, count: int, label: str, price_each: int, emoji: str):
+        if count and count > 0:
+            catalog.append({
+                "key": key,
+                "label": label,
+                "count": int(count),
+                "price_each": int(price_each),
+                "emoji": emoji,
+            })
+
+    _add("stone",     stones,   "Stone",                   SHOP_ITEMS["stone"]["price"],     EMO_STONE())
+    _add("badge",     badge,    "Bounty Hunter Badge",     SHOP_ITEMS["badge"]["price"],     EMO_BADGE())
+    _add("chicken",   chickens, "Fried Chicken",           SHOP_ITEMS["chicken"]["price"],   EMO_CHICKEN())
+    _add("sniper",    sniper,   "Sniper",                  SHOP_ITEMS["sniper"]["price"],    EMO_SNIPER())
+    _add("ticket_t3", t3,       "Dungeon Ticket (Tier 3)", SHOP_ITEMS["ticket_t3"]["price"], EMO_DUNGEON())
+    return catalog
+
+
+async def _shop_perform_sell(i: discord.Interaction, key: str, qty: int):
+    """
+    Performs a SELL and replies PUBLICLY (non-ephemeral) on both success and errors.
+    Mirrors the logic of the /sell command, but as a reusable helper for UI.
+    """
+    async def _send(msg: str):
+        return await send_boxed(i, "Shop — Sell", msg, icon="🛍️", ephemeral=False)
+
+    if not i.guild or not i.channel:
+        return await _send("Run this in a server.")
+
+    gid, uid, cid = i.guild.id, i.user.id, i.channel.id
+    key = str(key).strip().lower()
+
+    if qty <= 0:
+        return await _send("Quantity must be at least 1.")
+
+    # Stones
+    if key == "stone":
+        have = await get_stones(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many stones to sell.")
+        await change_stones(gid, uid, -qty)
+        refund = SHOP_ITEMS["stone"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_STONE()} Stone** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Badge (one-time)
+    if key == "badge":
+        have = await get_badge(gid, uid)
+        if have < 1 or qty != 1:
+            return await _send("You can only sell **one** Bounty Hunter Badge if you own it.")
+        await set_badge(gid, uid, 0)
+        refund = SHOP_ITEMS["badge"]["price"]
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        # Remove bounty role if present
+        try:
+            rid = (await get_cfg(gid))["bounty_role_id"]
+            role = i.guild.get_role(rid) if rid else None
+            member = i.guild.get_member(uid) or await i.guild.fetch_member(uid)
+            if role and member and bot_can_manage_role(i.guild, role):
+                await member.remove_roles(role, reason="Sold Bounty Hunter Badge")
+        except Exception as e:
+            log.warning(f"sell badge role removal failed: {e}")
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{EMO_BADGE()} Bounty Hunter Badge** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Chicken
+    if key == "chicken":
+        have = await get_chickens(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many fried chicken to sell.")
+        await change_chickens(gid, uid, -qty)
+        refund = SHOP_ITEMS["chicken"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_CHICKEN()} Fried Chicken** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Sniper (one-time)
+    if key == "sniper":
+        have = await get_sniper(gid, uid)
+        if have < 1 or qty != 1:
+            return await _send("You can only sell **one** Sniper if you own it.")
+        await set_sniper(gid, uid, 0)
+        refund = SHOP_ITEMS["sniper"]["price"]
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{EMO_SNIPER()} Sniper** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Tier-3 Ticket
+    if key == "ticket_t3":
+        have = await get_dungeon_tickets_t3(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many Tier-3 tickets to sell.")
+        await change_dungeon_tickets_t3(gid, uid, -qty)
+        refund = SHOP_ITEMS["ticket_t3"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_DUNGEON()} Tier-3 Ticket** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    return await _send("Can't sell that item here.")
+
+
 
 # -------------------- DUNGEON emojis/helpers --------------------
 EMO_DUNGEON_NAME = os.getenv("WW_DUNGEON_NAME", "ww_dungeon")
@@ -698,10 +814,10 @@ async def _shop_perform_buy(i: discord.Interaction, key: str, qty: int, *, _from
     Performs the shop purchase and replies:
       • PUBLIC message on success
       • Ephemeral message on validation / balance errors
+
     Works whether called from a slash command, a button, or a modal (deferred).
     """
 
-    # Helper: send as a boxed embed (uses your existing helper)
     async def _send(msg: str, *, ephemeral: bool = False):
         return await send_boxed(
             i,
@@ -711,139 +827,116 @@ async def _shop_perform_buy(i: discord.Interaction, key: str, qty: int, *, _from
             ephemeral=ephemeral,
         )
 
+    if not i.guild or not i.channel:
+        return await _send("Run this in a server.", ephemeral=True)
 
-    # Catalog (match your keys & prices)
-    key_norm = str(key).strip().lower().replace(" ", "_")
+    gid, cid, uid = i.guild.id, i.channel.id, i.user.id
+
+    # Canonical catalog for buy prices (must match your SHOP_ITEMS)
     CATALOG = {
-        "stone": {"label": "Stone", "price": 1},
-        "badge": {"label": "Bounty Hunter Badge", "price": 5},
-        "chicken": {"label": "Fried Chicken", "price": 2},
-        "sniper": {"label": "Sniper", "price": 100},
-        "t3_ticket": {"label": "Dungeon Ticket (Tier 3)", "price": 5},
+        "stone":     {"label": "Stone",                    "price": 1},
+        "badge":     {"label": "Bounty Hunter Badge",      "price": 5},
+        "chicken":   {"label": "Fried Chicken",            "price": 2},
+        "sniper":    {"label": "Sniper",                   "price": 100},
+        "ticket_t3": {"label": "Dungeon Ticket (Tier 3)",  "price": 5},
     }
-    ALIASES = {
-        "stones": "stone",
-        "bounty_hunter_badge": "badge",
-        "fried_chicken": "chicken",
-        "tier3": "t3_ticket",
-        "tier_3": "t3_ticket",
-  
-        "t3": "t3_ticket",
-        "dungeon_ticket": "t3_ticket",
-    }
-    key_norm = ALIASES.get(key_norm, key_norm)
-
-    # Validate item and quantity
-    item = CATALOG.get(key_norm)
-    if not item:
-        await _send(f"Unknown shop item: `{key}`.", ephemeral=True)
-        return
-    if qty <= 0:
-        await _send("Quantity must be at least 1.", ephemeral=True)
-        return
-    if qty > 100000:
-        await _send("That quantity is too large. Try something smaller.", ephemeral=True)
-        return
-
-    price = item["price"]
-    cost = price * qty
-
-        # Normalize key and catalog
-    key_norm = str(key).strip().lower().replace(" ", "_")
-    CATALOG = {
-        "stone": {"label": "Stone", "price": 1},
-        "badge": {"label": "Bounty Hunter Badge", "price": 5},
-        "chicken": {"label": "Fried Chicken", "price": 2},
-        "sniper": {"label": "Sniper", "price": 100},
-        "t3_ticket": {"label": "Dungeon Ticket (Tier 3)", "price": 5},
-    }
+    # Accept a few friendly aliases
     ALIASES = {
         "stones": "stone",
         "bounty_hunter_badge": "badge",
         "fried_chicken": "chicken",
         "sniper_rifle": "sniper",
-        "tier3": "t3_ticket",
-        "tier_3": "t3_ticket",
-        "t3": "t3_ticket",
-        "dungeon_ticket": "t3_ticket",
-        "ticket_t3": "t3_ticket",       # <-- accept button/command key you use elsewhere
+        "tier3": "ticket_t3",
+        "tier_3": "ticket_t3",
+        "t3": "ticket_t3",
+        "t3_ticket": "ticket_t3",
+        "dungeon_ticket": "ticket_t3",
+        "ticket_t3": "ticket_t3",
     }
+
+    key_norm = str(key).strip().lower().replace(" ", "_")
     key_norm = ALIASES.get(key_norm, key_norm)
 
+    # Validate item & quantity
     item = CATALOG.get(key_norm)
     if not item:
-        await _send(f"Unknown shop item: `{key}`.", ephemeral=True)
-        return
+        return await _send(f"Unknown shop item: `{key}`.", ephemeral=True)
+    if qty <= 0:
+        return await _send("Quantity must be at least 1.", ephemeral=True)
+    if qty > 100_000:
+        return await _send("That quantity is too large. Try something smaller.", ephemeral=True)
 
     # One-time items must be bought singly
     if key_norm in ("badge", "sniper") and qty != 1:
-        await _send("That item can only be bought one at a time.", ephemeral=True)
-        return
+        return await _send("That item can only be bought one at a time.", ephemeral=True)
 
-    gid = i.guild.id
-    cid = i.channel.id
-    uid = i.user.id
+    price = int(item["price"])
+    cost = price * qty
 
     # Economy glue → your DB helpers
-    async def _get_balance(uid: int) -> int:
-        return await get_balance(gid, uid)
+    async def _get_balance(uid_: int) -> int:
+        return await get_balance(gid, uid_)
 
-    async def _add_balance(uid: int, delta: int) -> None:
-        await change_balance(gid, uid, delta, announce_channel_id=cid)
+    async def _add_balance(uid_: int, delta: int) -> None:
+        await change_balance(gid, uid_, delta, announce_channel_id=cid)
 
-    async def _inv_add(uid: int, item_key: str, amount: int) -> None:
+    async def _inv_add(uid_: int, item_key: str, amount: int) -> None:
         if item_key == "stone":
-            await change_stones(gid, uid, amount)
+            await change_stones(gid, uid_, amount)
         elif item_key == "chicken":
-            await change_chickens(gid, uid, amount)
+            await change_chickens(gid, uid_, amount)
         elif item_key == "badge":
-            # already enforced qty=1
-            if await get_badge(gid, uid) >= 1:
+            if await get_badge(gid, uid_) >= 1:
                 raise RuntimeError("You already own the Bounty Hunter Badge.")
-            await set_badge(gid, uid, 1)
-            # Try to grant the bounty role right away
+            await set_badge(gid, uid_, 1)
+            # Grant bounty role if we can
             try:
                 rid = await ensure_bounty_role(i.guild)
                 role = i.guild.get_role(rid) if rid else None
-                member = i.guild.get_member(uid) or await i.guild.fetch_member(uid)
+                member = i.guild.get_member(uid_) or await i.guild.fetch_member(uid_)
                 if role and member and bot_can_manage_role(i.guild, role):
                     await member.add_roles(role, reason="Bought Bounty Hunter Badge")
             except Exception as e:
                 log.warning(f"grant bounty role failed: {e}")
         elif item_key == "sniper":
-            if await get_sniper(gid, uid) >= 1:
+            if await get_sniper(gid, uid_) >= 1:
                 raise RuntimeError("You already own the Sniper.")
-            await set_sniper(gid, uid, 1)
-        elif item_key == "t3_ticket":
-            await change_dungeon_tickets_t3(gid, uid, amount)
+            await set_sniper(gid, uid_, 1)
+        elif item_key == "ticket_t3":
+            await change_dungeon_tickets_t3(gid, uid_, amount)
         else:
             raise RuntimeError(f"Unhandled inventory item: {item_key}")
 
-    # ---------------------------------------------------------------------------------------
-
-    uid = i.user.id
     balance = await _get_balance(uid)
-
     if balance < cost:
         short = cost - balance
-        await _send(
+        return await _send(
             f"Not enough shekels: need **{short}** more (cost **{cost}**, you have **{balance}**).",
             ephemeral=True,
         )
-        return
 
-    # Do the purchase
-    await _add_balance(uid, -cost)
-    await _inv_add(uid, key_norm, qty)
-    new_balance = balance - cost
+    # Charge and deliver
+    try:
+        await _add_balance(uid, -cost)
+        await _inv_add(uid, key_norm, qty)
+    except RuntimeError as e:
+        # Refund if inventory op failed for a known reason
+        try:
+            await _add_balance(uid, +cost)
+        except Exception:
+            pass
+        return await _send(str(e), ephemeral=True)
 
+    new_balance = await _get_balance(uid)
     label = item["label"]
+
     # PUBLIC success message
     await _send(
-        f"**{i.user.mention}** bought **{qty}× {label}** for **{cost}** shekels. "
+        f"**{i.user.mention}** bought **{qty}× {label}** for **{cost}** {EMO_SHEKEL()}. "
         f"New balance: **{new_balance}**.",
         ephemeral=False,
     )
+
 
 
 
@@ -1763,15 +1856,17 @@ class QuantityModal(discord.ui.Modal):
         self.add_item(self.amount)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Lock modal to the opener (optional; keep if your ShopView is per-user)
+        # Only the opener can use their modal
         if self.owner_id and interaction.user.id != int(self.owner_id):
             try:
                 await interaction.response.send_message(
-                    "This shop view isn’t yours. Run `/shop` to open your own.", ephemeral=True
+                    "This shop view isn’t yours. Run `/shop` to open your own.",
+                    ephemeral=True,
                 )
             except discord.InteractionResponded:
                 await interaction.followup.send(
-                    "This shop view isn’t yours. Run `/shop` to open your own.", ephemeral=True
+                    "This shop view isn’t yours. Run `/shop` to open your own.",
+                    ephemeral=True,
                 )
             return
 
@@ -1787,57 +1882,201 @@ class QuantityModal(discord.ui.Modal):
                 await interaction.followup.send("Please enter a whole number ≥ 1.", ephemeral=True)
             return
 
-        # Acknowledge immediately so Discord doesn't show the generic error
-        await interaction.response.defer(thinking=False)  # not ephemeral → followups are PUBLIC
+        # Defer (non-ephemeral) so success can be PUBLIC
+        try:
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
 
         try:
-            # Success path posts PUBLICLY inside _shop_perform_buy
             await _shop_perform_buy(interaction, self.key, qty, _from_modal=True)
-        except Exception as e:
-            # Send a user-friendly fallback; re-raise to keep logs
-            await interaction.followup.send("Purchase failed unexpectedly. Please try again.", ephemeral=True)
+        except Exception:
+            # Friendly fallback; re-raise for logs if you prefer
+            try:
+                await interaction.followup.send("Purchase failed unexpectedly. Please try again.", ephemeral=True)
+            except Exception:
+                pass
             raise
 
+
+class SellQuantityModal(discord.ui.Modal):
+    def __init__(self, key: str, label: str, max_qty: int, price_each: int, owner_id: int | None):
+        super().__init__(title=f"Sell {label}")
+        self.key = key
+        self.label = label
+        self.max_qty = int(max_qty)
+        self.price_each = int(price_each)
+        self.owner_id = owner_id
+
+        hint = f"You own {self.max_qty}. Price each: {self.price_each} {EMO_SHEKEL()}."
+        self.amount = discord.ui.TextInput(
+            label="Quantity to sell",
+            placeholder=f"Enter 1–{self.max_qty}  ({hint})",
+            required=True,
+            min_length=1,
+            max_length=6,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.owner_id and interaction.user.id != int(self.owner_id):
+            return await send_boxed(interaction, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
+
+        # Parse & validate
+        try:
+            qty = int(str(self.amount.value).strip())
+        except ValueError:
+            return await send_boxed(interaction, "Shop — Sell", "Enter a whole number.", icon="🛍️")
+        if qty <= 0 or qty > self.max_qty:
+            return await send_boxed(interaction, "Shop — Sell", f"Enter **1–{self.max_qty}**.", icon="🛍️")
+
+        # Non-ephemeral so everyone sees it
+        try:
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
+
+        await _shop_perform_sell(interaction, self.key, qty)
 
 
 
 
 
 class ShopView(discord.ui.View):
-    """Buttons open a quantity modal; success messages are public."""
+    """Buttons open a quantity modal (buy) or a sell picker. Success messages are PUBLIC."""
     def __init__(self, inter: discord.Interaction, *, timeout: float = 300):
         super().__init__(timeout=timeout)
         self.owner_id = inter.user.id
+        self.message: Optional[discord.Message] = None  # set by /shop after send
 
         def add_buy_btn(key: str, label: str, emoji: str, style: discord.ButtonStyle):
             btn = discord.ui.Button(label=label, emoji=emoji, style=style)
 
             async def _cb(i: discord.Interaction, _key=key, _label=label):
                 if i.user.id != self.owner_id:
-                    return await i.response.send_message(
-                        "This isn’t your shop panel. Use **/shop** to open your own.",
-                        ephemeral=True,
-                    )
+                    return await send_boxed(i, "Shop", "This shop view isn’t yours. Use **/shop** to open your own.", icon="🛒")
                 await i.response.send_modal(QuantityModal(_key, _label, self.owner_id))
 
             btn.callback = _cb
             self.add_item(btn)
 
-        # One button per item (no more “Custom…” rows)
-        add_buy_btn("stone",     "Stone",      EMO_STONE(),   discord.ButtonStyle.primary)
-        add_buy_btn("badge",     "Badge",      EMO_BADGE(),   discord.ButtonStyle.secondary)
-        add_buy_btn("chicken",   "Chicken",    EMO_CHICKEN(), discord.ButtonStyle.secondary)
-        add_buy_btn("sniper",    "Sniper",     EMO_SNIPER(),  discord.ButtonStyle.secondary)
-        add_buy_btn("t3_ticket", "T3 Ticket",  EMO_DUNGEON(), discord.ButtonStyle.success)
+        # Buy buttons
+        add_buy_btn("stone",     "Stone",    EMO_STONE(),   discord.ButtonStyle.primary)
+        add_buy_btn("badge",     "Badge",    EMO_BADGE(),   discord.ButtonStyle.secondary)
+        add_buy_btn("chicken",   "Chicken",  EMO_CHICKEN(), discord.ButtonStyle.secondary)
+        add_buy_btn("sniper",    "Sniper",   EMO_SNIPER(),  discord.ButtonStyle.secondary)
+        add_buy_btn("ticket_t3", "T3 Ticket",EMO_DUNGEON(), discord.ButtonStyle.success)
+
+        # Sell button (opens picker)
+        self.sell_btn = discord.ui.Button(label="Sell", emoji="💸", style=discord.ButtonStyle.secondary)
+
+        async def _sell_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await send_boxed(i, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
+
+            # Non-ephemeral: show panel publicly
+            try:
+                await i.response.defer(thinking=False)
+            except Exception:
+                pass
+
+            owned = await _get_owned_sellables(i.guild.id, i.user.id)
+            if not owned:
+                return await send_boxed(i, "Shop — Sell", "You currently have **nothing** you can sell.", icon="🛍️")
+
+            # Pretty list for the embed
+            lines = []
+            for it in owned:
+                s = "" if it["count"] == 1 else "s"
+                lines.append(
+                    f"• {it['emoji']} **{it['label']}** — you own **{it['count']}** · sell price **{it['price_each']} {EMO_SHEKEL()}** each"
+                )
+            emb = make_panel(
+                title="Sell Items",
+                description="Pick an item from the selector below:",
+                fields=[("You can sell", "\n".join(lines), False)],
+                icon="🛍️",
+            )
+
+            view = SellMenuView(i, owned)
+            msg = await i.followup.send(embed=emb, view=view)
+            try:
+                view.message = msg
+            except Exception:
+                pass
+
+        self.sell_btn.callback = _sell_cb
+        self.add_item(self.sell_btn)
 
     async def on_timeout(self) -> None:
         for item in self.children:
             item.disabled = True
         try:
-            await self.message.edit(view=self)   # type: ignore[attr-defined]
+            if self.message:
+                await self.message.edit(view=self)
         except Exception:
             pass
 
+
+
+class SellMenuView(discord.ui.View):
+    def __init__(self, inter: discord.Interaction, owned: list[dict], *, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.owner_id = inter.user.id
+        self.owned = owned
+        self.message: Optional[discord.Message] = None
+
+        # Build a single Select with all owned items
+        options = []
+        for item in owned:
+            total = item["price_each"]
+            label = f"{item['emoji']} {item['label']}"
+            desc = f"Owned: {item['count']} • Sell price: {item['price_each']} each"
+            options.append(discord.SelectOption(label=label, value=item["key"], description=desc))
+
+        self.select = discord.ui.Select(placeholder="Pick an item to sell…", options=options)
+        self.select.callback = self._on_pick
+        self.add_item(self.select)
+
+        # Close button
+        @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
+        async def _close_btn(btn_inter: discord.Interaction, button: discord.ui.Button):
+            if btn_inter.user.id != self.owner_id:
+                return await send_boxed(btn_inter, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
+            try:
+                await btn_inter.response.edit_message(view=None)
+            except Exception:
+                pass
+        # attach button to view
+        setattr(self, "close_btn", _close_btn)
+
+    async def _on_pick(self, i: discord.Interaction):
+        if i.user.id != self.owner_id:
+            return await send_boxed(i, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
+        key = self.select.values[0]
+        item = next((x for x in self.owned if x["key"] == key), None)
+        if not item:
+            return await send_boxed(i, "Shop — Sell", "That item isn't available to sell.", icon="🛍️")
+
+        # Open quantity modal
+        await i.response.send_modal(
+            SellQuantityModal(
+                key=item["key"],
+                label=item["label"],
+                max_qty=item["count"],
+                price_each=item["price_each"],
+                owner_id=self.owner_id,
+            )
+        )
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
 
 
 
@@ -3556,13 +3795,22 @@ SHOP_ITEMS = {
 SHOP_ORDER = ["stone", "badge", "chicken", "sniper", "ticket_t3"]
 
 
+
 @tree.command(name="shop", description="Show the shop.")
 async def shop(inter: discord.Interaction):
     if not await guard_worldler_inter(inter):
         return
 
+    gid, uid = inter.guild.id, inter.user.id
+    bal = await get_balance(gid, uid)
     shek = EMO_SHEKEL()
-    lines = ["🛒 **Shop** — buy with the buttons (you’ll choose an amount), or sell with `/sell`", ""]
+
+    lines = [
+        "🛒 **Shop** — buy with the buttons, or sell with the **💸 Sell** button (or `/sell`).",
+        "",
+        f"**Your balance:** **{bal} {shek}**",
+        "",
+    ]
     for key in SHOP_ORDER:
         item = SHOP_ITEMS[key]
         price = item["price"]
@@ -3572,7 +3820,16 @@ async def shop(inter: discord.Interaction):
     lines.append("\nTip: For bulk buying via slash command, use `/buy item:{name} amount:{n}`.")
 
     emb = make_panel("Shop", "\n".join(lines), icon="🛒")
-    await inter.response.send_message(embed=emb, view=ShopView(inter))
+    view = ShopView(inter)
+    await inter.response.send_message(embed=emb, view=view)
+
+    try:
+        msg = await inter.original_response()
+        view.message = msg
+    except Exception:
+        pass
+
+
 
 
 
@@ -3591,6 +3848,7 @@ async def buy(inter: discord.Interaction, item: app_commands.Choice[str], amount
 
 
 
+
 @tree.command(name="sell", description="Sell items back to the shop for the same price.")
 @app_commands.describe(item="Item", amount="How many")
 @app_commands.choices(item=[
@@ -3598,79 +3856,24 @@ async def buy(inter: discord.Interaction, item: app_commands.Choice[str], amount
     app_commands.Choice(name="Bounty Hunter Badge", value="badge"),
     app_commands.Choice(name="Fried Chicken", value="chicken"),
     app_commands.Choice(name="Sniper", value="sniper"),
-    app_commands.Choice(name="Dungeon Ticket (Tier 3)", value="ticket_t3"),  # NEW
+    app_commands.Choice(name="Dungeon Ticket (Tier 3)", value="ticket_t3"),
 ])
-async def sell(inter: discord.Interaction, item: app_commands.Choice[str], amount: int=1):
-    if not await guard_worldler_inter(inter): 
+async def sell(inter: discord.Interaction, item: app_commands.Choice[str], amount: int = 1):
+    if not await guard_worldler_inter(inter):
         return
-    if not inter.guild: 
-        return await inter.response.send_message("Server only.", ephemeral=True)
-    if amount <= 0: 
-        return await inter.response.send_message("Amount must be positive.", ephemeral=True)
-    key, gid, uid, cid = item.value, inter.guild.id, inter.user.id, inter.channel_id
+    if not inter.guild:
+        return await send_boxed(inter, "Shop — Sell", "Server only.", icon="🛍️", ephemeral=False)
+    if amount <= 0:
+        return await send_boxed(inter, "Shop — Sell", "Amount must be positive.", icon="🛍️", ephemeral=False)
 
-    if key == "stone":
-        have = await get_stones(gid, uid)
-        if have < amount: 
-            return await inter.response.send_message("You don't have that many stones.", ephemeral=True)
-        await change_stones(gid, uid, -amount)
-        await change_balance(gid, uid, PRICE_STONE * amount, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **{amount}** {EMO_STONE()} for **{PRICE_STONE*amount} {EMO_SHEKEL()}**."
-        )
+    # Public reply (not ephemeral)
+    try:
+        await inter.response.defer(thinking=False)
+    except Exception:
+        pass
 
-    if key == "badge":
-        have = await get_badge(gid, uid)
-        if have < 1: 
-            return await inter.response.send_message("You don't own the badge.", ephemeral=True)
-        await set_badge(gid, uid, 0)
-        await change_balance(gid, uid, PRICE_BADGE, announce_channel_id=cid)
-        rid = (await get_cfg(gid))["bounty_role_id"]
-        try:
-            m = inter.guild.get_member(uid) or await inter.guild.fetch_member(uid)
-            r = inter.guild.get_role(rid) if rid else None
-            if r and bot_can_manage_role(inter.guild, r):
-                await m.remove_roles(r, reason="Sold Bounty Hunter Badge")
-        except Exception as e:
-            log.warning(f"remove bounty role failed: {e}")
-        return await inter.response.send_message(
-            f"Sold **Bounty Hunter Badge** for **{PRICE_BADGE} {EMO_SHEKEL()}** and lost the role."
-        )
+    await _shop_perform_sell(inter, item.value, amount)
 
-    if key == "chicken":
-        have = await get_chickens(gid, uid)
-        if have < amount: 
-            return await inter.response.send_message("You don't have that many fried chicken.", ephemeral=True)
-        await change_chickens(gid, uid, -amount)
-        await change_balance(gid, uid, PRICE_CHICK * amount, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **{amount}** {EMO_CHICKEN()} for **{PRICE_CHICK*amount} {EMO_SHEKEL()}**."
-        )
-
-    if key == "sniper":
-        have = await get_sniper(gid, uid)
-        if have < 1:
-            return await inter.response.send_message("You don't own the Sniper.", ephemeral=True)
-        if amount != 1:
-            return await inter.response.send_message("You can only sell one Sniper.", ephemeral=True)
-        await set_sniper(gid, uid, 0)
-        await change_balance(gid, uid, PRICE_SNIPER, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **Sniper** for **{PRICE_SNIPER} {EMO_SHEKEL()}**. You no longer have access to `/snipe`."
-        )
-
-    if key == "ticket_t3":
-        have = await get_dungeon_tickets_t3(gid, uid)
-        if have < amount:
-            return await inter.response.send_message("You don't have that many Tier-3 tickets.", ephemeral=True)
-        await change_dungeon_tickets_t3(gid, uid, -amount)
-        refund = 5 * amount
-        await change_balance(gid, uid, refund, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **{amount}** {EMO_DUNGEON()} Tier-3 Dungeon Ticket(s) for **{refund} {EMO_SHEKEL()}**."
-        )
-
-    await inter.response.send_message("Can't sell that.", ephemeral=True)
 
 
 @tree.command(name="eat", description="Eat a Fried Chicken to gain 1 hour stone immunity.")
