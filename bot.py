@@ -1749,7 +1749,7 @@ async def _build_dailies_embed(guild: discord.Guild, user: discord.Member) -> di
         title="🗓️ Daily Actions (UK reset)",
         description=(
             "All daily limits reset at **00:00 UK time** (Europe/London).\n"
-            "Use the **buttons** below or **react** with the matching emoji."
+            "Use the **buttons** below."
         ),
         fields=[
             ("Solo Worldles", f"Play up to **5/day**.\nYou have **{left}** left today. Start with **🧩**.", True),
@@ -1759,11 +1759,9 @@ async def _build_dailies_embed(guild: discord.Guild, user: discord.Member) -> di
         ],
         icon="🗓️"
     )
-    try:
-        emb.set_footer(text=f"Status shown for: {user.display_name}")
-    except Exception:
-        pass
+    emb.set_footer(text=f"Status shown for: {user.display_name}")
     return emb
+
 
 
 class DailiesView(discord.ui.View):
@@ -1776,6 +1774,7 @@ class DailiesView(discord.ui.View):
             await inter.response.send_message("Server only.", ephemeral=True)
             return False
         if not await is_worldler(inter.guild, inter.user):
+            # This one can stay ephemeral since it's an access warning
             await inter.response.send_message(
                 f"You need the **{WORLDLER_ROLE_NAME}** role. Use `/immigrate` to join.",
                 ephemeral=True
@@ -1784,24 +1783,30 @@ class DailiesView(discord.ui.View):
         return True
 
     async def _refresh_panel(self, inter: discord.Interaction):
-        """Re-render the dailies embed on the same message."""
+        """Rebuild & edit the /dailies message after an action."""
         try:
-            new_emb = await _build_dailies_embed(inter.guild, inter.user)
-            # keep the same view (self)
-            await inter.message.edit(embed=new_emb, view=self)
-        except Exception:
-            pass
+            emb = await _build_dailies_embed(inter.guild, inter.user)
+            # inter.message is the panel message that contained the button
+            if inter.message:
+                await inter.message.edit(embed=emb, view=self)
+        except Exception as e:
+            log.warning(f"[dailies] refresh failed: {e}")
 
     @discord.ui.button(label="Start Solo (w)", style=discord.ButtonStyle.primary, emoji="🧩")
     async def btn_solo(self, inter: discord.Interaction, button: discord.ui.Button):
         if not await self._ensure_worldler(inter): 
             return
-        await inter.response.defer(ephemeral=True, thinking=False)
+        await inter.response.defer(thinking=False)  # public
         ch = await solo_start(inter.channel, inter.user)
         if isinstance(ch, discord.TextChannel):
-            await inter.followup.send(f"Opened your solo room: {ch.mention}", ephemeral=True)
+            await send_boxed(
+                inter,
+                "Solo Room Opened",
+                f"{inter.user.mention} your room is {ch.mention}.",
+                icon="🧩",
+            )
         else:
-            await inter.followup.send("Couldn't start a solo right now.", ephemeral=True)
+            await send_boxed(inter, "Solo", "Couldn't start a solo right now.", icon="🧩")
         await self._refresh_panel(inter)
 
     @discord.ui.button(label="Pray (+5)", style=discord.ButtonStyle.success, emoji="🛐")
@@ -1812,12 +1817,12 @@ class DailiesView(discord.ui.View):
         today = uk_today_str()
         last_pray, _ = await _get_cd(gid, uid)
         if last_pray == today:
-            await inter.response.send_message("You already prayed today. Resets at **00:00 UK time**.", ephemeral=True)
+            await send_boxed(inter, "Daily — Pray", "You already prayed today. Resets at **00:00 UK time**.", icon="🛐")
         else:
             await change_balance(gid, uid, 5, announce_channel_id=cid)
             await _set_cd(gid, uid, "last_pray", today)
             bal = await get_balance(gid, uid)
-            await inter.response.send_message(f"🛐 +5 {EMO_SHEKEL()} — Balance **{bal}**", ephemeral=True)
+            await send_boxed(inter, "Daily — Pray", f"+5 {EMO_SHEKEL()}  · Balance **{bal}**", icon="🛐")
         await self._refresh_panel(inter)
 
     @discord.ui.button(label="Beg (+5 stones)", style=discord.ButtonStyle.secondary, emoji="🙇")
@@ -1828,25 +1833,26 @@ class DailiesView(discord.ui.View):
         today = uk_today_str()
         _, last_beg = await _get_cd(gid, uid)
         if last_beg == today:
-            await inter.response.send_message("You already begged today. Resets at **00:00 UK time**.", ephemeral=True)
+            await send_boxed(inter, "Daily — Beg", "You already begged today. Resets at **00:00 UK time**.", icon="🙇")
         else:
             await change_stones(gid, uid, 5)
             await _set_cd(gid, uid, "last_beg", today)
             stones = await get_stones(gid, uid)
-            await inter.response.send_message(f"🙇 {EMO_STONE()} +5 Stones — You now have **{stones}**.", ephemeral=True)
+            await send_boxed(inter, "Daily — Beg", f"{EMO_STONE()} +5 Stones. You now have **{stones}**.", icon="🙇")
         await self._refresh_panel(inter)
 
     @discord.ui.button(label="Word Pot", style=discord.ButtonStyle.secondary, emoji="🎰")
     async def btn_wordpot(self, inter: discord.Interaction, button: discord.ui.Button):
         if not await self._ensure_worldler(inter): 
             return
-        await inter.response.defer(ephemeral=True, thinking=False)
+        await inter.response.defer(thinking=False)  # public
         ch = await casino_start_word_pot(inter.channel, inter.user)
         if isinstance(ch, discord.TextChannel):
-            await inter.followup.send(f"Word Pot room: {ch.mention}", ephemeral=True)
+            await send_boxed(inter, "Word Pot Room Opened", f"{inter.user.mention} your room is {ch.mention}.", icon="🎰")
         else:
-            await inter.followup.send("Couldn't start Word Pot.", ephemeral=True)
+            await send_boxed(inter, "Word Pot", "Couldn't start Word Pot.", icon="🎰")
         await self._refresh_panel(inter)
+
 
 
 
@@ -2053,11 +2059,13 @@ async def dailies_cmd(inter: discord.Interaction):
     if not await guard_worldler_inter(inter):
         return
 
-    emb = await _build_dailies_embed(inter.guild, inter.user)  # now awaited
+    emb = await _build_dailies_embed(inter.guild, inter.user)
     view = DailiesView(inter.guild.id)
+
+    # Send panel publicly (not ephemeral)
     await inter.response.send_message(embed=emb, view=view)
 
-    # Add reaction controls too
+    # (Optional) keep the reaction shortcuts you already had
     try:
         msg = await inter.original_response()
         dailies_msg_ids.add(msg.id)
@@ -2068,6 +2076,7 @@ async def dailies_cmd(inter: discord.Interaction):
                 pass
     except Exception:
         pass
+
 
 
 
