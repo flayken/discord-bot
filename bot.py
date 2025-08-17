@@ -465,6 +465,47 @@ async def db_init():
 
 ##-------------------------------------HELPERS----------------------------------
 
+async def _build_shop_embed(gid: int, uid: int) -> discord.Embed:
+    bal = await get_balance(gid, uid)
+    shek = EMO_SHEKEL()
+    lines = [
+        "🛒 **Shop** — buy with the buttons, or sell with the **💸 Sell** button (or `/sell`).",
+        "",
+        f"**Your balance:** **{bal} {shek}**",
+        "",
+    ]
+    for key in SHOP_ORDER:
+        item = SHOP_ITEMS[key]
+        price = item["price"]
+        lines.append(
+            f"• **{item['label']}** — {price} {shek}{'' if price==1 else 's'}\n  _{item['desc']}_"
+        )
+    lines.append("\nTip: For bulk buying via slash command, use `/buy item:{name} amount:{n}`.")
+    return make_panel("Shop", "\n".join(lines), icon="🛒")
+
+
+async def _build_sell_embed(gid: int, uid: int, owned: list[dict]) -> discord.Embed:
+    bal = await get_balance(gid, uid)
+    shek = EMO_SHEKEL()
+
+    if not owned:
+        desc = f"**Your balance:** **{bal} {shek}**\n\nYou currently have **nothing** you can sell."
+        return make_panel("Sell Items", desc, icon="🛍️")
+
+    lines = [f"**Your balance:** **{bal} {shek}**", "", "You can sell:"]
+    for it in owned:
+        lines.append(
+            f"• {it['emoji']} **{it['label']}** — you own **{it['count']}** · sell price **{it['price_each']} {shek}** each"
+        )
+
+    return make_panel(
+        title="Sell Items",
+        description="Pick an item from the selector below:",
+        fields=[("Details", "\n".join(lines), False)],
+        icon="🛍️",
+    )
+
+
 async def _get_owned_sellables(gid: int, uid: int) -> list[dict]:
     """
     Return a list of items the user can sell, each as:
@@ -1840,15 +1881,24 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
 
 # --- Quantity modal: defer first, then buy; success is PUBLIC ---
 class QuantityModal(discord.ui.Modal):
-    def __init__(self, key: str, label: str | None = None, owner_id: int | None = None):
-        super().__init__(title=f"Buy {label}" if label else "How many?")
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        owner_id: int,
+        panel_channel_id: int,
+        panel_message_id: int,
+    ):
+        super().__init__(title=f"Buy {label}")
         self.key = key
         self.label = label
-        self.owner_id = owner_id
+        self.owner_id = int(owner_id)
+        self.panel_channel_id = int(panel_channel_id)
+        self.panel_message_id = int(panel_message_id)
 
         self.amount = discord.ui.TextInput(
-            label="Quantity",
-            placeholder="Enter a positive whole number (e.g., 3)",
+            label="Quantity to buy",
+            placeholder="Enter a positive whole number",
             required=True,
             min_length=1,
             max_length=6,
@@ -1856,57 +1906,65 @@ class QuantityModal(discord.ui.Modal):
         self.add_item(self.amount)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Only the opener can use their modal
-        if self.owner_id and interaction.user.id != int(self.owner_id):
-            try:
-                await interaction.response.send_message(
-                    "This shop view isn’t yours. Run `/shop` to open your own.",
-                    ephemeral=True,
-                )
-            except discord.InteractionResponded:
-                await interaction.followup.send(
-                    "This shop view isn’t yours. Run `/shop` to open your own.",
-                    ephemeral=True,
-                )
-            return
+        if interaction.user.id != self.owner_id:
+            return await send_boxed(
+                interaction, "Shop", "This shop view isn’t yours. Use **/shop** to open your own.", icon="🛒"
+            )
 
-        # Parse quantity
+        # validate
         try:
             qty = int(str(self.amount.value).strip())
-            if qty <= 0:
-                raise ValueError
         except ValueError:
-            try:
-                await interaction.response.send_message("Please enter a whole number ≥ 1.", ephemeral=True)
-            except discord.InteractionResponded:
-                await interaction.followup.send("Please enter a whole number ≥ 1.", ephemeral=True)
-            return
+            return await send_boxed(interaction, "Shop", "Enter a whole number.", icon="🛒")
+        if qty <= 0:
+            return await send_boxed(interaction, "Shop", "Enter a quantity greater than **0**.", icon="🛒")
 
-        # Defer (non-ephemeral) so success can be PUBLIC
+        # don’t block UI
         try:
             await interaction.response.defer(thinking=False)
         except Exception:
             pass
 
+        # do the buy (public confirmation)
+        # NOTE: keep this call name the same as in your codebase if different.
+        await _shop_perform_buy(interaction, self.key, qty)
+
+        # refresh the original Shop message so the balance updates
         try:
-            await _shop_perform_buy(interaction, self.key, qty, _from_modal=True)
+            gid, uid = interaction.guild.id, interaction.user.id
+            emb = await _build_shop_embed(gid, uid)
+
+            channel = interaction.client.get_channel(self.panel_channel_id) or await interaction.client.fetch_channel(self.panel_channel_id)
+            msg = await channel.fetch_message(self.panel_message_id)
+
+            view = ShopView(interaction)
+            view.message = msg
+            await msg.edit(embed=emb, view=view)
         except Exception:
-            # Friendly fallback; re-raise for logs if you prefer
-            try:
-                await interaction.followup.send("Purchase failed unexpectedly. Please try again.", ephemeral=True)
-            except Exception:
-                pass
-            raise
+            # swallow refresh errors to avoid breaking the purchase flow
+            pass
+
 
 
 class SellQuantityModal(discord.ui.Modal):
-    def __init__(self, key: str, label: str, max_qty: int, price_each: int, owner_id: int | None):
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        max_qty: int,
+        price_each: int,
+        owner_id: int | None,
+        panel_channel_id: int,
+        panel_message_id: int,
+    ):
         super().__init__(title=f"Sell {label}")
         self.key = key
         self.label = label
         self.max_qty = int(max_qty)
         self.price_each = int(price_each)
         self.owner_id = owner_id
+        self.panel_channel_id = int(panel_channel_id)
+        self.panel_message_id = int(panel_message_id)
 
         hint = f"You own {self.max_qty}. Price each: {self.price_each} {EMO_SHEKEL()}."
         self.amount = discord.ui.TextInput(
@@ -1922,7 +1980,6 @@ class SellQuantityModal(discord.ui.Modal):
         if self.owner_id and interaction.user.id != int(self.owner_id):
             return await send_boxed(interaction, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
 
-        # Parse & validate
         try:
             qty = int(str(self.amount.value).strip())
         except ValueError:
@@ -1930,23 +1987,40 @@ class SellQuantityModal(discord.ui.Modal):
         if qty <= 0 or qty > self.max_qty:
             return await send_boxed(interaction, "Shop — Sell", f"Enter **1–{self.max_qty}**.", icon="🛍️")
 
-        # Non-ephemeral so everyone sees it
         try:
             await interaction.response.defer(thinking=False)
         except Exception:
             pass
 
+        # Perform the sale (public confirmation message)
         await _shop_perform_sell(interaction, self.key, qty)
+
+        # Refresh the Sell panel (balance + counts)
+        try:
+            gid, uid = interaction.guild.id, interaction.user.id
+            owned = await _get_owned_sellables(gid, uid)
+            emb = await _build_sell_embed(gid, uid, owned)
+
+            channel = interaction.client.get_channel(self.panel_channel_id) or await interaction.client.fetch_channel(self.panel_channel_id)
+            msg = await channel.fetch_message(self.panel_message_id)
+
+            view = SellMenuView(interaction, owned)
+            view.message = msg
+            await msg.edit(embed=emb, view=view)
+        except Exception:
+            pass
+
 
 
 
 
 
 class ShopView(discord.ui.View):
-    """Buttons open a quantity modal (buy) or a sell picker. Success messages are PUBLIC."""
+    """Buttons open a quantity modal (buy) or switch to the Sell panel. Success messages are PUBLIC."""
     def __init__(self, inter: discord.Interaction, *, timeout: float = 300):
         super().__init__(timeout=timeout)
         self.owner_id = inter.user.id
+        self.guild_id = inter.guild.id
         self.message: Optional[discord.Message] = None  # set by /shop after send
 
         def add_buy_btn(key: str, label: str, emoji: str, style: discord.ButtonStyle):
@@ -1955,58 +2029,41 @@ class ShopView(discord.ui.View):
             async def _cb(i: discord.Interaction, _key=key, _label=label):
                 if i.user.id != self.owner_id:
                     return await send_boxed(i, "Shop", "This shop view isn’t yours. Use **/shop** to open your own.", icon="🛒")
-                await i.response.send_modal(QuantityModal(_key, _label, self.owner_id))
+                # pass panel ids so the modal can refresh the same message after purchase
+                await i.response.send_modal(
+                    QuantityModal(
+                        _key,
+                        _label,
+                        self.owner_id,
+                        panel_channel_id=i.channel.id,
+                        panel_message_id=self.message.id if self.message else i.message.id,
+                    )
+                )
 
             btn.callback = _cb
             self.add_item(btn)
 
         # Buy buttons
-        add_buy_btn("stone",     "Stone",    EMO_STONE(),   discord.ButtonStyle.primary)
-        add_buy_btn("badge",     "Badge",    EMO_BADGE(),   discord.ButtonStyle.secondary)
-        add_buy_btn("chicken",   "Chicken",  EMO_CHICKEN(), discord.ButtonStyle.secondary)
-        add_buy_btn("sniper",    "Sniper",   EMO_SNIPER(),  discord.ButtonStyle.secondary)
-        add_buy_btn("ticket_t3", "T3 Ticket",EMO_DUNGEON(), discord.ButtonStyle.success)
+        add_buy_btn("stone",     "Stone",     EMO_STONE(),   discord.ButtonStyle.primary)
+        add_buy_btn("badge",     "Badge",     EMO_BADGE(),   discord.ButtonStyle.secondary)
+        add_buy_btn("chicken",   "Chicken",   EMO_CHICKEN(), discord.ButtonStyle.secondary)
+        add_buy_btn("sniper",    "Sniper",    EMO_SNIPER(),  discord.ButtonStyle.secondary)
+        add_buy_btn("ticket_t3", "T3 Ticket", EMO_DUNGEON(), discord.ButtonStyle.success)
 
-        # Sell button (opens picker)
-        self.sell_btn = discord.ui.Button(label="Sell", emoji="💸", style=discord.ButtonStyle.secondary)
+        # SELL (red) — replaces this message with the Sell menu
+        sell_btn = discord.ui.Button(label="Sell", emoji="💸", style=discord.ButtonStyle.danger)
 
         async def _sell_cb(i: discord.Interaction):
             if i.user.id != self.owner_id:
                 return await send_boxed(i, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
-
-            # Non-ephemeral: show panel publicly
-            try:
-                await i.response.defer(thinking=False)
-            except Exception:
-                pass
-
             owned = await _get_owned_sellables(i.guild.id, i.user.id)
-            if not owned:
-                return await send_boxed(i, "Shop — Sell", "You currently have **nothing** you can sell.", icon="🛍️")
-
-            # Pretty list for the embed
-            lines = []
-            for it in owned:
-                s = "" if it["count"] == 1 else "s"
-                lines.append(
-                    f"• {it['emoji']} **{it['label']}** — you own **{it['count']}** · sell price **{it['price_each']} {EMO_SHEKEL()}** each"
-                )
-            emb = make_panel(
-                title="Sell Items",
-                description="Pick an item from the selector below:",
-                fields=[("You can sell", "\n".join(lines), False)],
-                icon="🛍️",
-            )
-
+            emb = await _build_sell_embed(i.guild.id, i.user.id, owned)
             view = SellMenuView(i, owned)
-            msg = await i.followup.send(embed=emb, view=view)
-            try:
-                view.message = msg
-            except Exception:
-                pass
+            view.message = self.message
+            await i.response.edit_message(embed=emb, view=view)
 
-        self.sell_btn.callback = _sell_cb
-        self.add_item(self.sell_btn)
+        sell_btn.callback = _sell_cb
+        self.add_item(sell_btn)
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -2016,6 +2073,8 @@ class ShopView(discord.ui.View):
                 await self.message.edit(view=self)
         except Exception:
             pass
+
+
 
 
 
@@ -2023,51 +2082,52 @@ class SellMenuView(discord.ui.View):
     def __init__(self, inter: discord.Interaction, owned: list[dict], *, timeout: float = 300):
         super().__init__(timeout=timeout)
         self.owner_id = inter.user.id
-        self.owned = owned
+        self.guild_id = inter.guild.id
+        self.channel_id = inter.channel.id
         self.message: Optional[discord.Message] = None
+        self.owned = owned
 
-        # Build a single Select with all owned items
+        # Select with owned items
         options = []
         for item in owned:
-            total = item["price_each"]
             label = f"{item['emoji']} {item['label']}"
             desc = f"Owned: {item['count']} • Sell price: {item['price_each']} each"
             options.append(discord.SelectOption(label=label, value=item["key"], description=desc))
 
-        self.select = discord.ui.Select(placeholder="Pick an item to sell…", options=options)
-        self.select.callback = self._on_pick
-        self.add_item(self.select)
+        select = discord.ui.Select(placeholder="Pick an item to sell…", options=options)
 
-        # Close button
-        @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
-        async def _close_btn(btn_inter: discord.Interaction, button: discord.ui.Button):
-            if btn_inter.user.id != self.owner_id:
-                return await send_boxed(btn_inter, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
-            try:
-                await btn_inter.response.edit_message(view=None)
-            except Exception:
-                pass
-        # attach button to view
-        setattr(self, "close_btn", _close_btn)
+        async def _on_pick(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await send_boxed(i, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
 
-    async def _on_pick(self, i: discord.Interaction):
-        if i.user.id != self.owner_id:
-            return await send_boxed(i, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
-        key = self.select.values[0]
-        item = next((x for x in self.owned if x["key"] == key), None)
-        if not item:
-            return await send_boxed(i, "Shop — Sell", "That item isn't available to sell.", icon="🛍️")
-
-        # Open quantity modal
-        await i.response.send_modal(
-            SellQuantityModal(
-                key=item["key"],
-                label=item["label"],
-                max_qty=item["count"],
-                price_each=item["price_each"],
-                owner_id=self.owner_id,
+            await i.response.send_modal(
+                SellQuantityModal(
+                    key=select.values[0],
+                    label=next(x["label"] for x in self.owned if x["key"] == select.values[0]),
+                    max_qty=next(x["count"] for x in self.owned if x["key"] == select.values[0]),
+                    price_each=next(x["price_each"] for x in self.owned if x["key"] == select.values[0]),
+                    owner_id=self.owner_id,
+                    panel_channel_id=self.channel_id,
+                    panel_message_id=self.message.id if self.message else i.message.id,
+                )
             )
-        )
+
+        select.callback = _on_pick
+        self.add_item(select)
+
+        # Back to Shop
+        back_btn = discord.ui.Button(label="Shop", emoji="🛒", style=discord.ButtonStyle.primary)
+
+        async def _back(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await send_boxed(i, "Shop", "This shop view isn’t yours. Use **/shop** to open your own.", icon="🛒")
+            emb = await _build_shop_embed(self.guild_id, self.owner_id)
+            view = ShopView(i)
+            view.message = self.message
+            await i.response.edit_message(embed=emb, view=view)
+
+        back_btn.callback = _back
+        self.add_item(back_btn)
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -2077,6 +2137,7 @@ class SellMenuView(discord.ui.View):
                 await self.message.edit(view=self)
         except Exception:
             pass
+
 
 
 
@@ -3801,25 +3862,7 @@ async def shop(inter: discord.Interaction):
     if not await guard_worldler_inter(inter):
         return
 
-    gid, uid = inter.guild.id, inter.user.id
-    bal = await get_balance(gid, uid)
-    shek = EMO_SHEKEL()
-
-    lines = [
-        "🛒 **Shop** — buy with the buttons, or sell with the **💸 Sell** button (or `/sell`).",
-        "",
-        f"**Your balance:** **{bal} {shek}**",
-        "",
-    ]
-    for key in SHOP_ORDER:
-        item = SHOP_ITEMS[key]
-        price = item["price"]
-        lines.append(
-            f"• **{item['label']}** — {price} {shek}{'' if price==1 else 's'}\n  _{item['desc']}_"
-        )
-    lines.append("\nTip: For bulk buying via slash command, use `/buy item:{name} amount:{n}`.")
-
-    emb = make_panel("Shop", "\n".join(lines), icon="🛒")
+    emb = await _build_shop_embed(inter.guild.id, inter.user.id)
     view = ShopView(inter)
     await inter.response.send_message(embed=emb, view=view)
 
@@ -3828,6 +3871,7 @@ async def shop(inter: discord.Interaction):
         view.message = msg
     except Exception:
         pass
+
 
 
 
