@@ -12,188 +12,6 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 import aiosqlite
 
-import math, random
-from typing import Dict, List
-
-
-
-#---------------------------CONSTANTS---------------------------
-
-# channel_id -> asyncio.Task for the ticking loop
-dungeon_timer_tasks: Dict[int, asyncio.Task] = {}
-_timer_quips_cache: Dict[str, List[str]] | None = None
-
-def _dungeon_time_limit_for_tier(tier: int) -> int:
-    """T3=15m, T2=10m, T1=5m — returns seconds."""
-    if tier >= 3:
-        return 15 * 60
-    if tier == 2:
-        return 10 * 60
-    return 5 * 60
-
-def _load_timer_quips() -> Dict[str, List[str]]:
-    """
-    Load quips from dungeon_timer_quips.txt into buckets:
-    calm, tense, urgent, final.
-    """
-    global _timer_quips_cache
-    if _timer_quips_cache is not None:
-        return _timer_quips_cache
-
-    buckets = {"calm": [], "tense": [], "urgent": [], "final": []}
-    try:
-        with open("dungeon_timer_quips.txt", "r", encoding="utf-8") as f:
-            for raw in f:
-                s = raw.strip()
-                if not s:
-                    continue
-                for key in buckets.keys():
-                    tag = f"[{key}]"
-                    if s.lower().startswith(tag):
-                        buckets[key].append(s[len(tag):].strip())
-                        break
-    except Exception:
-        # Fallbacks if the file isn't reachable for some reason.
-        buckets = {
-            "calm":   ["The dungeon rumbles somewhere far below."],
-            "tense":  ["Time taps its foot."],
-            "urgent": ["The torchlight gutters. Work faster."],
-            "final":  ["Seconds fall like hammers."],
-        }
-
-    # Ensure no empty bucket to avoid index errors
-    for k, v in buckets.items():
-        if not v:
-            buckets[k] = ["..."]
-
-    _timer_quips_cache = buckets
-    return _timer_quips_cache
-
-def _pick_quip(bucket: str, game: dict) -> str:
-    """
-    Returns a non-repeating quip for this game+bucket, resetting when exhausted.
-    """
-    all_quips = _load_timer_quips()[bucket]
-    used = game.setdefault("_quip_used", {}).setdefault(bucket, set())
-    choices = [q for q in all_quips if q not in used]
-    if not choices:
-        used.clear()
-        choices = all_quips[:]
-    q = random.choice(choices)
-    used.add(q)
-    return q
-
-def _bucket_for_time_left(secs_left: int, total_secs: int) -> str:
-    """
-    Bucket mapping:
-      > 2/3 total -> calm
-      1/3..2/3   -> tense
-      61..1/3    -> urgent
-      <= 60      -> final
-    """
-    if secs_left <= 60:
-        return "final"
-    frac = secs_left / max(1, total_secs)
-    if frac > (2/3):
-        return "calm"
-    if frac > (1/3):
-        return "tense"
-    return "urgent"
-
-async def _send_timer_warning(game: dict, text: str):
-    """Sends a simple warning line to the dungeon channel."""
-    ch_id = game.get("channel_id")
-    if not ch_id:
-        return
-    ch = bot.get_channel(ch_id)
-    if ch:
-        try:
-            await ch.send(text)
-        except Exception:
-            pass
-
-
-# NEW: call _dungeon_start_timer(game) right after the dungeon actually begins
-async def _dungeon_start_timer(game: dict):
-    """
-    Initializes the dungeon clock and kicks off the ticking task.
-    Stores:
-      - timer_total_secs
-      - timer_end_ts
-      - timer_warn_minutes_sent (set[int])
-      - timer_warn_10s_sent (set[int])
-    """
-    total = _dungeon_time_limit_for_tier(game.get("tier", 1))
-    now = time.time()
-    game["timer_total_secs"] = total
-    game["timer_end_ts"] = now + total
-    game["timer_warn_minutes_sent"] = set()
-    game["timer_warn_10s_sent"] = set()
-
-    ch_id = game.get("channel_id")
-    # Cancel old task if somehow present
-    old = dungeon_timer_tasks.pop(ch_id, None)
-    if old and not old.done():
-        old.cancel()
-
-    # Kick a fresh loop
-    task = asyncio.create_task(_dungeon_timer_task(ch_id))
-    dungeon_timer_tasks[ch_id] = task
-
-async def _dungeon_timer_task(ch_id: int):
-    """
-    Sends one warning per minute (ceiling semantics like 14:01..15 => '15 mins left'),
-    and in the last minute sends warnings every 10 seconds.
-    When timer hits 0, settles the dungeon with the full pool.
-    """
-    def _get_game():
-        return dungeon_games.get(ch_id)
-
-    while True:
-        await asyncio.sleep(1)
-        game = _get_game()
-        if not game:
-            break  # dungeon closed elsewhere
-
-        end_ts = game.get("timer_end_ts")
-        total = game.get("timer_total_secs", 0)
-        if not end_ts or total <= 0:
-            break
-
-        now = time.time()
-        secs_left = int(math.ceil(end_ts - now))
-
-        # Done?
-        if secs_left <= 0:
-            await _dungeon_time_up(game)
-            break
-
-        # > 60s left: one per minute (ceil)
-        if secs_left > 60:
-            mins_display = math.ceil(secs_left / 60)
-            sent = game["timer_warn_minutes_sent"]
-            if mins_display not in sent:
-                sent.add(mins_display)
-                bucket = _bucket_for_time_left(secs_left, total)
-                quip = _pick_quip(bucket, game)
-                unit = "min" if mins_display == 1 else "mins"
-                await _send_timer_warning(game, f"⏳ **{mins_display} {unit} left.** {quip}")
-        else:
-            # Last minute: warn every 10 seconds, including "1:00" at 60s.
-            tens = min(60, (secs_left // 10) * 10)  # clamp to 60..10
-            if tens >= 10:
-                sent10 = game["timer_warn_10s_sent"]
-                if tens not in sent10:
-                    sent10.add(tens)
-                    quip = _pick_quip("final", game)
-                    label = "1:00" if tens == 60 else f"0:{tens:02d}"
-                    await _send_timer_warning(game, f"⏳ **{label} left.** {quip}")
-
-
-
-  
-
-
 # -------------------- basic setup --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("wordle")
@@ -646,6 +464,226 @@ async def db_init():
 
 
 ##-------------------------------------HELPERS----------------------------------
+
+
+# -------------------- Dungeon UI (paged) --------------------
+
+# 2 short-paragraph lore blurbs per tier (ancient wizards & lost knowledge theme)
+_DUNGEON_LORE = {
+    3: (
+        "Past a sealed lectern is a staircase that wasn’t there until you needed it. "
+        "Shelves drift like constellations; books never written sit beside those never allowed. "
+        "Invisible librarians reshelve fate.",
+
+        "The Arch-Archivist hid the **Index of Forgotten Things** here. Every answer has teeth. "
+        "You won’t leave unchanged—but if you are brave, you will leave **true**."
+    ),
+    2: (
+        "Beneath the archive is the **Scriptorium of Errata** where apprentices rewrote history "
+        "in erasable ink. The floor is a palimpsest of mistakes that learned to whisper.",
+
+        "Wards flicker; glyphs bargain. The **Corrector’s Quill** grants power but demands precision. "
+        "Those who rush their answers feed the quill more than ink."
+    ),
+    1: (
+        "At the root lies the **Redacted Sanctum**, where the First Wizard hid knowledge from even themself. "
+        "Light arrives late; echoes arrive early. Letters arrange themselves if you stare long enough.",
+
+        "A bell tolls when truth is near. Toll it too often and the room tolls back. "
+        "Answers here are heavy and must be lifted carefully."
+    ),
+}
+
+def _tier_stats(tier: int) -> tuple[int, int]:
+    """Returns (tries_per_round, reward_multiplier) using your code's rules:
+       T3=5×1, T2=4×2, T1=3×3."""
+    tries = 5 if tier == 3 else 4 if tier == 2 else 3
+    mult  = 1 if tier == 3 else 2 if tier == 2 else 3
+    return tries, mult
+
+def _loot_lines_for_tier(tier: int) -> list[str]:
+    """Matches your real loot logic:
+       • Every solve: +1 Stone
+       • T3: 10% chance → +1 Tier 2 Ticket
+       • T2: 10% chance → +1 Tier 1 Ticket
+       • T1: no ticket drops
+    """
+    lines = [f"• +1 {EMO_STONE()} on every solved word"]
+    if tier == 3:
+        lines.append("• 10% chance per solve → +1 Tier 2 Ticket")
+    elif tier == 2:
+        lines.append("• 10% chance per solve → +1 Tier 1 Ticket")
+    return lines
+
+async def _ticket_count_for(gid: int, uid: int, tier: int) -> int:
+    if tier == 3:
+        return await get_dungeon_tickets_t3(gid, uid)
+    elif tier == 2:
+        return await get_dungeon_tickets_t2(gid, uid)
+    else:
+        return await get_dungeon_tickets_t1(gid, uid)
+
+async def _build_dungeon_embed(gid: int, uid: int, page: str) -> discord.Embed:
+    """
+    page ∈ {"t1","t2","t3","rules"}
+    """
+    shek, stone = EMO_SHEKEL(), EMO_STONE()
+    if page == "rules":
+        desc = (
+            "Co-op Wordle, but perilous:\n"
+            "• Solve a word to add shekels to the **pool** (amount depends on attempt & tier multiplier).\n"
+            "• After each solve, the **owner** chooses: **Continue** (⏩) or **Cash Out** ().\n"
+            "• If a round **fails**, the pool is **halved (rounded up)** and paid, then the dungeon closes.\n"
+            "• Max tries per round depend on tier. T1 is hardest but pays the most per solve.\n"
+            "• Tickets are consumed on entry. T3 tickets are bought in /shop; T2/T1 drop in lower floors."
+        )
+        flds = [
+            ("Tries & Multipliers",
+             "• Tier 3: 5 tries · ×1 rewards\n"
+             "• Tier 2: 4 tries · ×2 rewards\n"
+             "• Tier 1: 3 tries · ×3 rewards",
+             False),
+            ("General Tips",
+             "• Bring friends; participants share the pool.\n"
+             "• Precision beats speed—wrong paths burn attempts.\n"
+             "• Cash out if the hint matrix looks grim.",
+             False),
+        ]
+        return make_panel(
+            title=f"{EMO_DUNGEON()} Dungeon — Rules",
+            description=desc,
+            fields=flds
+        )
+
+    tier = 3 if page == "t3" else 2 if page == "t2" else 1
+    tries, mult = _tier_stats(tier)
+    lore1, lore2 = _DUNGEON_LORE[tier]
+    tix = await _ticket_count_for(gid, uid, tier)
+
+    desc = f"**Tier {tier}** — {['','The Scriptorium of Errata','The Unbound Stacks'][tier-1] if tier!=1 else 'The Redacted Sanctum'}\n\n{lore1}\n\n{lore2}"
+    loot = "\n".join(_loot_lines_for_tier(tier))
+
+    flds = [
+        ("Rewards", f"Tier {tier} multiplier ×**{mult}** · **{tries}** tries per round", False),
+        ("Loot Table", loot, False),
+        ("To enter", f"Use **/worldle_dungeon tier:Tier {tier}** — or click the green button below.", False),
+    ]
+    return make_panel(
+        title=f"{EMO_DUNGEON()} Dungeon — Tier {tier}",
+        description=desc,
+        fields=flds
+    )
+
+
+import asyncio  # make sure this import exists near your other imports
+
+class DungeonView(discord.ui.View):
+    """4-page dungeon guide; Enter button calls /worldle_dungeon and live-updates ticket count.
+       On the Rules page the Enter button is removed entirely.
+    """
+    def __init__(self, inter: discord.Interaction, start_tier: int = 3):
+        super().__init__(timeout=300)
+        self.inter = inter
+        self.guild_id = inter.guild.id
+        self.user_id = inter.user.id
+        self.page = f"t{start_tier}"  # 't1' | 't2' | 't3' | 'rules'
+        self.message: discord.Message | None = None  # set by the command after sending
+
+    # ---------- internal helpers ----------
+    def _current_tier(self) -> int:
+        if self.page == "t3":
+            return 3
+        if self.page == "t2":
+            return 2
+        return 1
+
+    def _has_enter_button(self) -> bool:
+        # Is the green button currently attached to the view?
+        return any(isinstance(child, discord.ui.Button) and child is self.enter_button for child in self.children)
+
+    async def refresh_page(self, i: discord.Interaction | None = None):
+        """Rebuild embed + sync presence/label of the Enter button."""
+        emb = await _build_dungeon_embed(self.guild_id, self.user_id, self.page)
+
+        # Manage presence of Enter button (remove on Rules; ensure present otherwise)
+        if self.page == "rules":
+            if self._has_enter_button():
+                self.remove_item(self.enter_button)
+        else:
+            if not self._has_enter_button():
+                # Re-attach the same Button instance so we don't lose its callback
+                self.add_item(self.enter_button)
+
+            # Update label with current ticket count and disable if 0
+            t = self._current_tier()
+            count = await _ticket_count_for(self.guild_id, self.user_id, t)
+            self.enter_button.label = f"Enter Dungeon — T{t} ({count} tickets)"
+            self.enter_button.disabled = (count <= 0)
+
+        # Push UI
+        if i is not None:
+            try:
+                await i.response.edit_message(embed=emb, view=self)
+            except discord.InteractionResponded:
+                if self.message:
+                    await self.message.edit(embed=emb, view=self)
+        elif self.message is not None:
+            await self.message.edit(embed=emb, view=self)
+
+    # ---------- navigation ----------
+    @discord.ui.button(label="Tier 1", style=discord.ButtonStyle.secondary)
+    async def t1_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "t1"
+        await self.refresh_page(i)
+
+    @discord.ui.button(label="Tier 2", style=discord.ButtonStyle.secondary)
+    async def t2_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "t2"
+        await self.refresh_page(i)
+
+    @discord.ui.button(label="Tier 3", style=discord.ButtonStyle.secondary)
+    async def t3_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "t3"
+        await self.refresh_page(i)
+
+    @discord.ui.button(label="Rules", style=discord.ButtonStyle.secondary)
+    async def rules_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "rules"
+        await self.refresh_page(i)
+
+    # ---------- primary action ----------
+    @discord.ui.button(label="Enter Dungeon", style=discord.ButtonStyle.success, row=1)
+    async def enter_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        """Invoke your /worldle_dungeon slash command, then refresh the ticket count."""
+        # Determine tier from current page (if on rules we shouldn't have this button at all)
+        t = self._current_tier()
+
+        # Look up the app command on your global tree and call its callback
+        cmd = tree.get_command("worldle_dungeon")  # keep this name in sync with your slash command
+        if cmd is None:
+            return await i.response.send_message("Dungeon command not found.", ephemeral=True)
+
+        choice = app_commands.Choice(name=f"Tier {t}", value=t)
+
+        binding = getattr(cmd, "binding", None)
+        if binding is not None:
+            await cmd.callback(binding, i, choice)
+        else:
+            await cmd.callback(i, choice)
+
+        # After the command runs, tickets might be consumed—refresh the label in-place.
+        # Use the stored message to avoid response state conflicts.
+        # A tiny yield lets anything deferred finish updating your storage.
+        await asyncio.sleep(0)
+        await self.refresh_page()  # edits self.message with new ticket count
+
+
+
+
+
+
+
+
 
 # --- Dailies helpers (UK reset) ---
 async def get_solo_wordles_left(guild_id: int, user_id: int) -> int:
@@ -3501,14 +3539,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                     )
                 except Exception:
                     pass
-    
-            # ⬇️ Start the run-wide timer ONCE, right here
-            await _dungeon_start_timer(game)
-    
-            # First round
             await _dungeon_start_round(game)
             return
-
 
     # ---------- DUNGEON: owner decision (⏩ continue / 💰 cash out) ----------
     for ch_id, game in list(dungeon_games.items()):
@@ -3529,6 +3561,21 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 
 
+
+# -------------------- /dungeon (UI entry) --------------------
+
+@tree.command(name="dungeon", description="Dungeon book: tiers, lore, loot, and Enter button.")
+async def dungeon_ui(inter: discord.Interaction):
+    if not await guard_worldler_inter(inter):
+        return
+    view = DungeonView(inter, start_tier=3)
+    emb = await _build_dungeon_embed(inter.guild.id, inter.user.id, "t3")
+    await inter.response.send_message(embed=emb, view=view)
+    try:
+        view.message = await inter.original_response()
+    except Exception:
+        pass
+    await view.refresh_page()  # <-- set button label/state now
 
 
 
@@ -3669,11 +3716,8 @@ async def _make_dungeon_channel(invocation_channel: discord.TextChannel, owner: 
 
 
 # -------------------- DUNGEON logic --------------------
-# REPLACE your _dungeon_max_for_tier with this
-def _dungeon_max_for_tier(_tier: int) -> int:
-    """All tiers have the same number of guesses now."""
-    return 5
-
+def _dungeon_max_for_tier(tier: int) -> int:
+    return 5 if tier == 3 else 4 if tier == 2 else 3  # T3=5, T2=4, T1=3
 
 def _dungeon_mult_for_tier(tier: int) -> int:
     return 1 if tier == 3 else 2 if tier == 2 else 3  # T3 base, T2 double, T1 triple
@@ -3769,56 +3813,6 @@ async def _dungeon_settle_and_close(game: dict, payout_each: int, note: str):
 
 
 
-# NEW: uses your existing _dungeon_settle_and_close(game, total_payout, note)
-async def _dungeon_time_up(game: dict):
-    """Called when the dungeon timer expires: pay out the full pool and close."""
-    ch_id = game.get("channel_id")
-    # stop ticking
-    task = dungeon_timer_tasks.pop(ch_id, None)
-    if task and not task.done():
-        task.cancel()
-
-    total_pool = max(0, int(game.get("pool", 0)))
-    note = "⏰ Time! The dungeon seals. Paying out the **entire** pool."
-    try:
-        await _dungeon_settle_and_close(game, total_pool, note)
-    except Exception:
-        # If your settle throws, at least try to mark closed so the loop stops.
-        dungeon_games.pop(ch_id, None)
-
-async def _dungeon_on_round_failed(game: dict):
-    """
-    Party used all 5 guesses and missed.
-    Instead of ending/halving rewards, subtract 60s from the timer and start a fresh round.
-    """
-    # Cut 1 minute from the end time (never below 'now + 1s' so the timer loop can finish cleanly)
-    end_ts = game.get("timer_end_ts")
-    if end_ts:
-        new_end = end_ts - 60
-        now = time.time()
-        game["timer_end_ts"] = max(new_end, now + 1)
-
-    # Announce the penalty with a friendly remaining-time readout
-    secs_left = int(max(0, math.ceil(game.get("timer_end_ts", time.time()) - time.time())))
-    if secs_left > 60:
-        mins_display = math.ceil(secs_left / 60)
-        unit = "min" if mins_display == 1 else "mins"
-        tail = f"{mins_display} {unit} left."
-    else:
-        tens = min(60, (secs_left // 10) * 10)
-        tail = "1:00 left." if tens == 60 else f"0:{tens:02d} left."
-
-    ch = bot.get_channel(game.get("channel_id"))
-    if ch:
-        try:
-            await ch.send(f"❌ **Round failed.** Timer reduced by **1 minute** — {tail}")
-        except Exception:
-            pass
-
-    # Reset round state and begin a new word
-    game["guesses"] = []
-    game["legend"] = {}
-    await _dungeon_start_round(game)
 
 
 
@@ -3922,12 +3916,12 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
         game["state"] = "await_decision"
         return
 
-    # ❗ NEW: fail round => minus 1 minute, keep the dungeon running
     if attempt == game["max"]:
-        await _dungeon_on_round_failed(game)
+        from math import ceil
+        half_each = ceil(max(0, game.get("pool", 0)) / 2)
+        await _dungeon_settle_and_close(game, half_each, note="❌ Round failed; reward halved (rounded up).")
         return
 
-    # MID-GAME STATUS
     next_attempt = attempt + 1
     payout = payout_for_attempt(next_attempt) * _dungeon_mult_for_tier(game["tier"])
     hint = legend_overview(game["legend"])
@@ -3942,12 +3936,11 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
 
 
 
-
 @tree.command(name="worldle_dungeon", description="Open a Worldle Dungeon (Tier 1/2/3).")
 @app_commands.describe(tier="Dungeon tier")
 @app_commands.choices(tier=[
-    app_commands.Choice(name="Tier 1 (triple rewards · 5 tries)", value=1),
-    app_commands.Choice(name="Tier 2 (double rewards · 5 tries)", value=2),
+    app_commands.Choice(name="Tier 1 (triple rewards · 3 tries)", value=1),
+    app_commands.Choice(name="Tier 2 (double rewards · 4 tries)", value=2),
     app_commands.Choice(name="Tier 3 (base rewards · 5 tries)",   value=3),
 ])
 async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Choice[int]):
@@ -4029,14 +4022,12 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
 
     # Spooky welcome in dungeon channel (boxed) with lock control
     welcome_txt = (
-    "🕯️ **Welcome, adventurers…**\n"
-    "The air is cold and the walls whisper letters you cannot see.\n"
-    "Each failed round **reduces the timer by 1 minute** instead of ending the run.\n"
-    "When the timer hits **0**, the dungeon ends and everyone is paid the **full pool**.\n\n"
-    f"**Tier {t}**: rewards multiplier ×{_dungeon_mult_for_tier(t)}, tries **{_dungeon_max_for_tier(t)}** per Wordle.\n"
-    "When everyone has joined, the **owner** must click **🔒** below to seal the gate and begin."
-  )
-
+        "🕯️ **Welcome, adventurers…**\n"
+        "The air is cold and the walls whisper letters you cannot see.\n"
+        "Solve quickly or **lose half your spoils** to the shadows.\n\n"
+        f"**Tier {t}**: rewards multiplier ×{_dungeon_mult_for_tier(t)}, tries **{_dungeon_max_for_tier(t)}** per Wordle.\n"
+        "When everyone has joined, the **owner** must click **🔒** below to seal the gate and begin."
+    )
     welcome = await send_boxed(
         ch,
         f"Dungeon — Tier {t}",
