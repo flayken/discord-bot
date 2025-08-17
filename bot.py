@@ -465,6 +465,38 @@ async def db_init():
 
 ##-------------------------------------HELPERS----------------------------------
 
+# --- Dailies helpers (UK reset) ---
+async def get_solo_wordles_left(guild_id: int, user_id: int) -> int:
+    """How many solo games remain today for this user (max 5/day, UK-local reset)."""
+    today = uk_today_str()
+    plays = await get_solo_plays_today(guild_id, user_id, today)
+    return max(0, 5 - int(plays))
+
+async def has_prayed_today(guild_id: int, user_id: int) -> bool:
+    """True if user already did /pray today (UK-local reset)."""
+    today = uk_today_str()
+    last_pray, _ = await _get_cd(guild_id, user_id)
+    return (last_pray == today)
+
+async def has_begged_today(guild_id: int, user_id: int) -> bool:
+    """True if user already did /beg today (UK-local reset)."""
+    today = uk_today_str()
+    _, last_beg = await _get_cd(guild_id, user_id)
+    return (last_beg == today)
+
+
+# --- Word Pot total (use casino pot) ---
+async def get_word_pot_total(guild_id: int) -> int:
+    """
+    Drop-in replacement: report the casino Word Pot amount.
+    """
+    try:
+        return await get_casino_pot(guild_id)
+    except Exception:
+        return 0
+
+
+
 async def _build_shop_embed(gid: int, uid: int) -> discord.Embed:
     bal = await get_balance(gid, uid)
     shek = EMO_SHEKEL()
@@ -1047,6 +1079,12 @@ async def set_casino_pot(gid: int, pot_val: int):
       ON CONFLICT(guild_id) DO UPDATE SET pot=excluded.pot
     """, (gid, pot_val))
     await bot.db.commit()
+    # 🔄 refresh any open /dailies panels in this guild
+    try:
+        await DailiesView.refresh_pot_label_for_guild(gid)
+    except Exception as e:
+        log.warning(f"[dailies] pot refresh failed for guild {gid}: {e}")
+
 
 # ------- streak helpers -------
 async def _get_streak(gid: int, uid: int):
@@ -2349,125 +2387,238 @@ last_bounty_guess_ts: dict[tuple[int, int], int] = {}
 
 
 
-async def _build_dailies_embed(guild: discord.Guild, user: discord.Member) -> discord.Embed:
-    """Boxed summary of daily actions + your current status (UK-time resets)."""
-    gid, uid = guild.id, user.id
-    today = uk_today_str()
+async def _build_dailies_embed(guild_id: int, user_id: int) -> discord.Embed:
+    solo_left   = await get_solo_wordles_left(guild_id, user_id)
+    prayed_done = await has_prayed_today(guild_id, user_id)
+    begged_done = await has_begged_today(guild_id, user_id)
+    pot_amount  = await get_word_pot_total(guild_id)
 
-    plays = await get_solo_plays_today(gid, uid, today)
-    last_pray, last_beg = await _get_cd(gid, uid)
-
-    left = max(0, 5 - int(plays or 0))
-    prayed = "✅ done today" if last_pray == today else "🟢 ready"
-    begged = "✅ done today" if last_beg == today else "🟢 ready"
-
-    emb = make_panel(
-        title="🗓️ Daily Actions (UK reset)",
+    em = discord.Embed(
+        title="📅 Daily Actions (UK reset)",
+        color=discord.Color.blurple(),
         description=(
             "All daily limits reset at **00:00 UK time** (Europe/London).\n"
-            "Use the **buttons** below."
-        ),
-        fields=[
-            ("Solo Worldles", f"Play up to **5/day**.\nYou have **{left}** left today. Start with **🧩**.", True),
-            ("Pray", f"+5 {EMO_SHEKEL()} once per day.\nStatus: **{prayed}**. Use **🛐**.", True),
-            ("Beg", f"+5 {EMO_STONE()} once per day.\nStatus: **{begged}**. Use **🙇**.", True),
-            ("Extras", "🎰 **Word Pot** (casino) — not a daily, but fun! Use **🎰**.", False),
-        ],
-        icon="🗓️"
+            "Use the buttons below.\n\n"
+            "**Solo Worldles**\n"
+            "Play up to **5/day**.\n"
+            f"You have **{solo_left}** left today.\n"
+            "Start with 🎲.\n\n"
+            "**Pray**\n"
+            "+5 ẅ once per day.\n"
+            f"Status: {'✅ done today.' if prayed_done else '❌ not done yet.'}\n"
+            "Use: 🙏\n\n"
+            "**Beg**\n"
+            "+5 🧱 stones once per day.\n"
+            f"Status: {'✅ done today.' if begged_done else '❌ not done yet.'}\n"
+            "Use: 🤲\n\n"
+            "**Extras**\n"
+            "💰 **Word Pot** — not a daily, but fun!\n"
+            f"Current pot: {EMO_SHEKEL()} **{pot_amount}** available to win.\n"
+            "Use the 💰 Word Pot button below."
+        )
     )
-    emb.set_footer(text=f"Status shown for: {user.display_name}")
-    return emb
+    em.set_footer(text=f"Status shown for user ID {user_id}")
+    return em
 
 
+
+
+
+
+# --- DailiesView (drop-in replacement) ---
+import weakref
+from collections import defaultdict
+from typing import Optional
 
 class DailiesView(discord.ui.View):
-    def __init__(self, guild_id: int, *, timeout: float = 300):
+    """
+    Dailies panel buttons.
+
+    - Word Pot button shows: 'Word Pot (X shekels)' with a 💰 icon.
+    - The panel can be refreshed from *outside* (e.g., when the pot changes)
+      via: await DailiesView.refresh_pot_label_for_guild(guild_id)
+    """
+
+    # registry of active views by guild (weak refs so they clean up automatically)
+    _registry: dict[int, "weakref.WeakSet[DailiesView]"] = defaultdict(weakref.WeakSet)
+
+    def __init__(self, interaction: discord.Interaction, *, pot_amount: int, timeout: float = 300):
         super().__init__(timeout=timeout)
-        self.guild_id = guild_id
+        self.owner_id = interaction.user.id
+        self.guild_id: Optional[int] = interaction.guild.id if interaction.guild else None
+        self.message: Optional[discord.Message] = None  # set right after /dailies send
+        self.btn_pot: Optional[discord.ui.Button] = None
 
-    async def _ensure_worldler(self, inter: discord.Interaction) -> bool:
-        if not inter.guild:
-            await inter.response.send_message("Server only.", ephemeral=True)
-            return False
-        if not await is_worldler(inter.guild, inter.user):
-            # This one can stay ephemeral since it's an access warning
-            await inter.response.send_message(
-                f"You need the **{WORLDLER_ROLE_NAME}** role. Use `/immigrate` to join.",
-                ephemeral=True
-            )
-            return False
-        return True
+        # --- Start Solo ---
+        btn_start = discord.ui.Button(
+            label="Start Solo (w)",
+            emoji="🎲",
+            style=discord.ButtonStyle.primary,
+        )
 
-    async def _refresh_panel(self, inter: discord.Interaction):
-        """Rebuild & edit the /dailies message after an action."""
+        async def _start_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild or not i.channel:
+                return
+            ch = await solo_start(i.channel, i.user)
+            if isinstance(ch, discord.TextChannel):
+                await send_boxed(i, "Solo Room Opened", f"{i.user.mention} your room is {ch.mention}.", icon="🧩", ephemeral=False)
+            await self._refresh_panel(i)
+
+        btn_start.callback = _start_cb
+        self.add_item(btn_start)
+
+        # --- Pray (+5) ---
+        btn_pray = discord.ui.Button(
+            label="Pray (+5)",
+            emoji="🙏",
+            style=discord.ButtonStyle.success,
+        )
+
+        async def _pray_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild:
+                return
+            gid, uid, cid = i.guild.id, i.user.id, getattr(i.channel, "id", None)
+            today = uk_today_str()
+            last_pray, _ = await _get_cd(gid, uid)
+            if last_pray == today:
+                await send_boxed(i, "Daily — Pray", "You already prayed today. Resets at **00:00 UK time**.", icon="🛐", ephemeral=True)
+            else:
+                await change_balance(gid, uid, 5, announce_channel_id=cid)
+                await _set_cd(gid, uid, "last_pray", today)
+                bal = await get_balance(gid, uid)
+                await send_boxed(i, "Daily — Pray", f"+5 {EMO_SHEKEL()}  · Balance **{bal}**", icon="🛐", ephemeral=False)
+            await self._refresh_panel(i)
+
+        btn_pray.callback = _pray_cb
+        self.add_item(btn_pray)
+
+        # --- Beg (+5 stones) ---
+        btn_beg = discord.ui.Button(
+            label="Beg (+5 stones)",
+            emoji="🤲",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        async def _beg_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild:
+                return
+            gid, uid = i.guild.id, i.user.id
+            today = uk_today_str()
+            _, last_beg = await _get_cd(gid, uid)
+            if last_beg == today:
+                await send_boxed(i, "Daily — Beg", "You already begged today. Resets at **00:00 UK time**.", icon="🙇", ephemeral=True)
+            else:
+                await change_stones(gid, uid, 5)
+                await _set_cd(gid, uid, "last_beg", today)
+                stones = await get_stones(gid, uid)
+                await send_boxed(i, "Daily — Beg", f"{EMO_STONE()} +5 Stones. You now have **{stones}**.", icon="🙇", ephemeral=False)
+            await self._refresh_panel(i)
+
+        btn_beg.callback = _beg_cb
+        self.add_item(btn_beg)
+
+        # --- Word Pot (label: 'Word Pot (X shekels)') ---
+        btn_pot = discord.ui.Button(
+            label=f"Word Pot ({pot_amount} shekels)",
+            emoji="💰",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        async def _pot_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild or not i.channel:
+                return
+            ch = await casino_start_word_pot(i.channel, i.user)
+            if isinstance(ch, discord.TextChannel):
+                await send_boxed(i, "Word Pot", f"{i.user.mention} Word Pot room: {ch.mention}", icon="💰", ephemeral=False)
+            # initial refresh right after starting
+            await self._refresh_panel(i)
+
+        btn_pot.callback = _pot_cb
+        self.add_item(btn_pot)
+        self.btn_pot = btn_pot
+
+    # called by /dailies after sending the message
+    def attach_message(self, msg: discord.Message) -> None:
+        self.message = msg
+        if self.guild_id is not None:
+            DailiesView._registry[self.guild_id].add(self)
+
+    async def _refresh_panel(self, i: discord.Interaction):
+        """Refresh the dailies embed + Word Pot button label from inside an interaction."""
         try:
-            emb = await _build_dailies_embed(inter.guild, inter.user)
-            # inter.message is the panel message that contained the button
-            if inter.message:
-                await inter.message.edit(embed=emb, view=self)
-        except Exception as e:
-            log.warning(f"[dailies] refresh failed: {e}")
+            if not i.guild:
+                return
+            latest = await get_word_pot_total(i.guild.id)
+            if self.btn_pot:
+                self.btn_pot.label = f"Word Pot ({latest} shekels)"
+            emb = await _build_dailies_embed(i.guild.id, self.owner_id)
 
-    @discord.ui.button(label="Start Solo (w)", style=discord.ButtonStyle.primary, emoji="🧩")
-    async def btn_solo(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
-            return
-        await inter.response.defer(thinking=False)  # public
-        ch = await solo_start(inter.channel, inter.user)
-        if isinstance(ch, discord.TextChannel):
-            await send_boxed(
-                inter,
-                "Solo Room Opened",
-                f"{inter.user.mention} your room is {ch.mention}.",
-                icon="🧩",
-            )
-        else:
-            await send_boxed(inter, "Solo", "Couldn't start a solo right now.", icon="🧩")
-        await self._refresh_panel(inter)
+            target_msg = self.message or (await i.original_response() if i.response.is_done() else None)
+            if target_msg:
+                await target_msg.edit(embed=emb, view=self)
+            else:
+                await i.edit_original_response(embed=emb, view=self)
+        except Exception:
+            pass  # never blow up the UX
 
-    @discord.ui.button(label="Pray (+5)", style=discord.ButtonStyle.success, emoji="🛐")
-    async def btn_pray(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
+    @classmethod
+    async def refresh_pot_label_for_guild(cls, guild_id: int) -> None:
+        """
+        External refresh: call this AFTER the pot value changes anywhere.
+        It updates the button label *and* the embed for all active dailies in that guild.
+        """
+        views = list(cls._registry.get(guild_id, ()))  # snapshot
+        if not views:
             return
-        gid, uid, cid = inter.guild.id, inter.user.id, inter.channel.id
-        today = uk_today_str()
-        last_pray, _ = await _get_cd(gid, uid)
-        if last_pray == today:
-            await send_boxed(inter, "Daily — Pray", "You already prayed today. Resets at **00:00 UK time**.", icon="🛐")
-        else:
-            await change_balance(gid, uid, 5, announce_channel_id=cid)
-            await _set_cd(gid, uid, "last_pray", today)
-            bal = await get_balance(gid, uid)
-            await send_boxed(inter, "Daily — Pray", f"+5 {EMO_SHEKEL()}  · Balance **{bal}**", icon="🛐")
-        await self._refresh_panel(inter)
 
-    @discord.ui.button(label="Beg (+5 stones)", style=discord.ButtonStyle.secondary, emoji="🙇")
-    async def btn_beg(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
-            return
-        gid, uid = inter.guild.id, inter.user.id
-        today = uk_today_str()
-        _, last_beg = await _get_cd(gid, uid)
-        if last_beg == today:
-            await send_boxed(inter, "Daily — Beg", "You already begged today. Resets at **00:00 UK time**.", icon="🙇")
-        else:
-            await change_stones(gid, uid, 5)
-            await _set_cd(gid, uid, "last_beg", today)
-            stones = await get_stones(gid, uid)
-            await send_boxed(inter, "Daily — Beg", f"{EMO_STONE()} +5 Stones. You now have **{stones}**.", icon="🙇")
-        await self._refresh_panel(inter)
+        latest = await get_word_pot_total(guild_id)
+        to_prune = []
+        for view in views:
+            try:
+                if view.btn_pot:
+                    view.btn_pot.label = f"Word Pot ({latest} shekels)"
+                emb = await _build_dailies_embed(guild_id, view.owner_id)
+                if view.message:
+                    await view.message.edit(embed=emb, view=view)
+                else:
+                    # no message yet (race) — skip, we'll catch it on next call
+                    pass
+            except Exception:
+                to_prune.append(view)
+        # prune broken/dead views
+        for v in to_prune:
+            try:
+                cls._registry[guild_id].discard(v)
+            except Exception:
+                pass
 
-    @discord.ui.button(label="Word Pot", style=discord.ButtonStyle.secondary, emoji="🎰")
-    async def btn_wordpot(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
-            return
-        await inter.response.defer(thinking=False)  # public
-        ch = await casino_start_word_pot(inter.channel, inter.user)
-        if isinstance(ch, discord.TextChannel):
-            await send_boxed(inter, "Word Pot Room Opened", f"{inter.user.mention} your room is {ch.mention}.", icon="🎰")
-        else:
-            await send_boxed(inter, "Word Pot", "Couldn't start Word Pot.", icon="🎰")
-        await self._refresh_panel(inter)
+    async def on_timeout(self) -> None:
+        for c in self.children:
+            c.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
+        # unregister on timeout
+        try:
+            if self.guild_id is not None:
+                self._registry[self.guild_id].discard(self)
+        except Exception:
+            pass
+
+
+
+
+
 
 
 
@@ -2657,7 +2808,7 @@ async def dailies_raw_reaction_add(payload: discord.RawReactionActionEvent):
         # 🔄 Refresh the panel embed (leave existing buttons/view intact)
         try:
             msg = await channel.fetch_message(payload.message_id)
-            new_emb = await _build_dailies_embed(guild, member)
+            new_emb = await _build_dailies_embed(guild.id, member.id)
             await msg.edit(embed=new_emb)
         except Exception:
             pass
@@ -2668,30 +2819,25 @@ async def dailies_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
       
 
-@tree.command(name="dailies", description="See and click your daily actions (UK reset).")
-async def dailies_cmd(inter: discord.Interaction):
-    if not inter.guild:
-        return await inter.response.send_message("Run this in a server.", ephemeral=True)
-    if not await guard_worldler_inter(inter):
-        return
+@tree.command(name="dailies", description="Show your daily actions.")
+async def dailies(interaction: discord.Interaction):
+    emb = await _build_dailies_embed(interaction.guild.id, interaction.user.id)
+    pot_amount = await get_word_pot_total(interaction.guild.id)
 
-    emb = await _build_dailies_embed(inter.guild, inter.user)
-    view = DailiesView(inter.guild.id)
+    view = DailiesView(interaction, pot_amount=pot_amount)
+    await interaction.response.send_message(embed=emb, view=view)
 
-    # Send panel publicly (not ephemeral)
-    await inter.response.send_message(embed=emb, view=view)
-
-    # (Optional) keep the reaction shortcuts you already had
     try:
-        msg = await inter.original_response()
-        dailies_msg_ids.add(msg.id)
-        for emo in ("🧩", "🛐", "🙇", "🎰"):
-            try:
-                await msg.add_reaction(emo)
-            except Exception:
-                pass
+        msg = await interaction.original_response()
+        view.attach_message(msg)
+        dailies_msg_ids.add(msg.id)  # 👈 add this
     except Exception:
         pass
+
+
+
+
+
 
 
 
