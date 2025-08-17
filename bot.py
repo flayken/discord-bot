@@ -1235,14 +1235,24 @@ async def solo_start(invocation_channel: discord.TextChannel, user: discord.Memb
 
     plays = await get_solo_plays_today(gid, uid, today)
     if plays >= 5:
-        await invocation_channel.send(f"{user.mention} you've reached your **5 solo games** for today. Resets at **00:00 UK time**.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(
+            invocation_channel,
+            "Solo Wordle",
+            f"{user.mention} you've reached your **5 solo games** for today. Resets at **00:00 UK time**.",
+            icon="🧩",
+        )
         return None
 
     existing_cid = solo_channels.get((gid, uid))
     if existing_cid and _key(gid, existing_cid, uid) in solo_games:
         ch = invocation_channel.guild.get_channel(existing_cid)
         if isinstance(ch, discord.TextChannel):
-            await invocation_channel.send(f"{user.mention} you already have a game running: {ch.mention}", allowed_mentions=discord.AllowedMentions.none())
+            await send_boxed(
+                invocation_channel,
+                "Solo Wordle",
+                f"{user.mention} you already have a game running: {ch.mention}",
+                icon="🧩",
+            )
             return ch
         else:
             solo_channels.pop((gid, uid), None)
@@ -1258,7 +1268,7 @@ async def solo_start(invocation_channel: discord.TextChannel, user: discord.Memb
         "legend": {},
         "origin_cid": invocation_channel.id,
         "start_date": uk_today_str(),  # record which UK day this slot was consumed
-        "snipers_tried": set(),        # NEW: shooters who already took a shot at THIS game
+        "snipers_tried": set(),        # shooters who already took a shot at THIS game
     }
     solo_channels[(gid, uid)] = ch.id
     await inc_solo_plays_today(gid, uid, today)
@@ -1266,47 +1276,57 @@ async def solo_start(invocation_channel: discord.TextChannel, user: discord.Memb
     if plays == 0:
         await update_streak_on_play(gid, uid, today)
 
-    board = render_board(solo_games[_key(gid, ch.id, uid)]["guesses"])
     left = 5 - (plays + 1)
-    await ch.send(
-        f"{user.mention} 🎮 **Your Wordle is ready!** (today’s uses left after this: **{left}**)\n"
-        f"You have **5 tries**.\nPayouts if you solve: 1st=5, 2nd=4, 3rd=3, 4th=2, 5th=1.",
-        allowed_mentions=discord.AllowedMentions(users=[user])
+    await send_boxed(
+        ch,
+        "Solo — Your Wordle is ready",
+        (
+            f"{user.mention} You have **5 tries**.\n"
+            "Payouts if you solve: 1st=5, 2nd=4, 3rd=3, 4th=2, 5th=1.\n"
+            f"Today’s uses left **after this**: **{left}**."
+        ),
+        icon="🧩",
     )
-    await ch.send(board)
+    board = render_board(solo_games[_key(gid, ch.id, uid)]["guesses"])
+    await ch.send(board)  # board stays unboxed/plain
     return ch
+
 
 
 
 async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: str):
     gid, cid, uid = channel.guild.id, channel.id, user.id
-    game = solo_games.get(_key(gid,cid,uid))
+    game = solo_games.get(_key(gid, cid, uid))
     if not game:
-        await channel.send(f"{user.mention} no game here. Start with `w` or `/worldle`.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(channel, "Solo Wordle", f"{user.mention} no game here. Start with `w` or `/worldle`.", icon="🧩")
         return
 
     cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
     if len(cleaned) != 5:
-        await channel.send("Guess must be **exactly 5 letters**."); return
+        await send_boxed(channel, "Invalid Guess", "Guess must be **exactly 5 letters**.", icon="❗")
+        return
     if not is_valid_guess(cleaned):
-        await channel.send("That’s not in the Wordle dictionary (UK variants supported)."); return
+        await send_boxed(channel, "Invalid Guess", "That’s not in the Wordle dictionary (UK variants supported).", icon="📚")
+        return
     if len(game["guesses"]) >= game["max"]:
-        await channel.send("Out of tries! Start a new one with `w`."); return
+        await send_boxed(channel, "Solo Wordle", "Out of tries! Start a new one with `w`.", icon="🧩")
+        return
 
     colors = score_guess(cleaned, game["answer"])
     game["guesses"].append({"word": cleaned, "colors": colors})
     update_legend(game["legend"], cleaned, colors)
 
     board = render_board(game["guesses"])
+    await channel.send(board)  # keep the board as plain text
+
     attempt = len(game["guesses"])
 
-    await channel.send(board)
-
     def _cleanup():
-        solo_games.pop(_key(gid,cid,uid), None)
+        solo_games.pop(_key(gid, cid, uid), None)
         if solo_channels.get((gid, uid)) == cid:
             solo_channels.pop((gid, uid), None)
 
+    # WIN
     if cleaned == game["answer"]:
         payout = payout_for_attempt(attempt)
         if payout:
@@ -1316,23 +1336,28 @@ async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: s
         ans = game["answer"].upper()
         _cleanup()
 
-        await channel.send(
-            f"🎉 {user.mention} solved it on attempt **{attempt}**! **Word: {ans}** · Payout **{payout} {EMO_SHEKEL()}**. Balance **{bal_new}**.",
-            allowed_mentions=discord.AllowedMentions.none()
+        await send_boxed(
+            channel,
+            "🏁 Solo — Solved!",
+            f"{user.mention} solved **{ans}** on attempt **{attempt}** and earned **{payout} {EMO_SHEKEL()}**.\nBalance **{bal_new}**",
+            icon="🎉",
         )
 
         emb = make_card(
             title="🏁 Solo — Finished",
             description=f"{user.mention} solved **{ans}** in **{attempt}** tries and earned **{payout} {EMO_SHEKEL()}**.",
-            fields=[("Board", board, False)],  # <-- no code block
+            fields=[("Board", board, False)],
             color=CARD_COLOR_SUCCESS,
         )
         await _announce_result(channel.guild, origin_cid, content="", embed=emb)
 
-        try: await channel.delete(reason="Wordle World solo finished (win)")
-        except Exception: pass
+        try:
+            await channel.delete(reason="Wordle World solo finished (win)")
+        except Exception:
+            pass
         return
 
+    # FAIL (out of tries)
     if attempt == game["max"]:
         ans_raw = game["answer"]
         ans = ans_raw.upper()
@@ -1342,12 +1367,13 @@ async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: s
         _cleanup()
         await inc_stat(gid, uid, "solo_fails", 1)
         bal_now = await get_balance(gid, uid)
-        def_line = f"\n📖 Definition: {definition}" if definition else ""
-        await channel.send(f"❌ Out of tries. The word was **{ans}** — {quip}{def_line}\nBalance **{bal_now}**.")
 
+        desc = f"❌ Out of tries. The word was **{ans}** — {quip}\nBalance **{bal_now}**."
         fields = [("Board", board, False)]
         if definition:
             fields.append(("Definition", definition, False))
+        await send_boxed(channel, "💀 Solo — Failed", desc, icon="💀", fields=fields)
+
         emb = make_card(
             title="💀 Solo — Failed",
             description=f"{user.mention} failed their Worldle. The word was **{ans}** — {quip}",
@@ -1356,16 +1382,22 @@ async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: s
         )
         await _announce_result(channel.guild, origin_cid, content="", embed=emb)
 
-        try: await channel.delete(reason="Wordle World solo finished (out of tries)")
-        except Exception: pass
+        try:
+            await channel.delete(reason="Wordle World solo finished (out of tries)")
+        except Exception:
+            pass
         return
 
+    # MID-GAME STATUS (box the legend)
     next_attempt = attempt + 1
     legend = legend_overview(game["legend"], game["guesses"])
     payout = payout_for_attempt(next_attempt)
-    msg = f"Attempt **{attempt}/{game['max']}** — If you solve on attempt **{next_attempt}**, payout will be **{payout}**."
-    if legend: msg += f"\n{legend}"
-    await channel.send(msg)
+    status = f"Attempt **{attempt}/{game['max']}** — If you solve on attempt **{next_attempt}**, payout will be **{payout}**."
+    flds = [("Next", status, False)]
+    if legend:
+        flds.append(("Legend", legend, False))
+    await send_boxed(channel, "Solo — Status", "", icon="🧩", fields=flds)
+
 
 
 
@@ -1376,14 +1408,14 @@ async def casino_start_word_pot(invocation_channel: discord.TextChannel, user: d
 
     bal = await get_balance(gid, uid)
     if bal < 1:
-        await invocation_channel.send(f"{user.mention} you need **1 {EMO_SHEKEL()}** to play Word Pot.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(invocation_channel, "Word Pot", f"{user.mention} you need **1 {EMO_SHEKEL()}** to play.", icon="🎰")
         return None
 
     existing_cid = casino_channels.get((gid, uid))
     if existing_cid and _key(gid, existing_cid, uid) in casino_games:
         ch = invocation_channel.guild.get_channel(existing_cid)
         if isinstance(ch, discord.TextChannel):
-            await invocation_channel.send(f"{user.mention} you already have a Word Pot game running: {ch.mention}", allowed_mentions=discord.AllowedMentions.none())
+            await send_boxed(invocation_channel, "Word Pot", f"{user.mention} you already have a game running: {ch.mention}", icon="🎰")
             return ch
         else:
             casino_channels.pop((gid, uid), None)
@@ -1401,35 +1433,38 @@ async def casino_start_word_pot(invocation_channel: discord.TextChannel, user: d
     casino_channels[(gid, uid)] = ch.id
 
     pot = await get_casino_pot(gid)
-    board = render_board(casino_games[_key(gid, ch.id, uid)]["guesses"], total_rows=3)
-    await ch.send(
-        f"{user.mention} 🎰 **Word Pot** is live!\n"
-        f"• Entry: **1 {EMO_SHEKEL()}** (already paid)\n"
-        f"• Current Pot: **{pot} {EMO_SHEKEL()}** (resets to {CASINO_BASE_POT} on win)\n"
-        f"• You have **3 tries** — solve within 3 to **win the pot**.\n"
-        f"If you fail, your entry adds **+1** to the pot.",
-        allowed_mentions=discord.AllowedMentions(users=[user])
+    await send_boxed(
+        ch,
+        "🎰 Word Pot",
+        (
+            f"{user.mention} • Entry: **1 {EMO_SHEKEL()}** (paid)\n"
+            f"• Current Pot: **{pot} {EMO_SHEKEL()}** (resets to {CASINO_BASE_POT} on win)\n"
+            "• You have **3 tries** — solve within 3 to **win the pot**.\n"
+            "If you fail, your entry adds **+1** to the pot."
+        ),
+        icon="🎰",
     )
-    await ch.send(board)
+    board = render_board(casino_games[_key(gid, ch.id, uid)]["guesses"], total_rows=3)
+    await ch.send(board)  # board as plain text
     return ch
+
 
 async def casino_guess(channel: discord.TextChannel, user: discord.Member, word: str):
     gid, cid, uid = channel.guild.id, channel.id, user.id
     game = casino_games.get(_key(gid, cid, uid))
     if not game:
-        await safe_send(channel, f"{user.mention} no Word Pot game here. Start with `/worldle_casino`.",
-                        allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(channel, "Word Pot", f"{user.mention} no Word Pot game here. Start with `/worldle_casino`.", icon="🎰")
         return
 
     cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
     if len(cleaned) != 5:
-        await safe_send(channel, "Guess must be **exactly 5 letters**.")
+        await send_boxed(channel, "Invalid Guess", "Guess must be **exactly 5 letters**.", icon="❗")
         return
     if not is_valid_guess(cleaned):
-        await safe_send(channel, "That’s not in the Wordle dictionary (UK variants supported).")
+        await send_boxed(channel, "Invalid Guess", "That’s not in the Wordle dictionary (UK variants supported).", icon="📚")
         return
     if len(game["guesses"]) >= game["max"]:
-        await safe_send(channel, "Out of tries! Start a new one with `/worldle_casino`.")
+        await send_boxed(channel, "Word Pot", "Out of tries! Start a new one with `/worldle_casino`.", icon="🎰")
         return
 
     colors = score_guess(cleaned, game["answer"])
@@ -1438,7 +1473,7 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
     attempt = len(game["guesses"])
 
     board = render_board(game["guesses"], total_rows=3)
-    await safe_send(channel, board)
+    await safe_send(channel, board)  # board stays plain
 
     def _cleanup():
         casino_games.pop(_key(gid, cid, uid), None)
@@ -1455,17 +1490,18 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
         _cleanup()
         await set_casino_pot(gid, CASINO_BASE_POT)
 
-        await safe_send(
+        await send_boxed(
             channel,
-            f"🏆 {user.mention} solved **{ans}** on attempt **{attempt}** and **WON {pot} {EMO_SHEKEL()}**! "
-            f"Pot resets to **{CASINO_BASE_POT}**. (Balance: {bal_new})"
+            "🏆 Word Pot — WIN",
+            f"{user.mention} solved **{ans}** on attempt **{attempt}** and **WON {pot} {EMO_SHEKEL()}**!\nPot resets to **{CASINO_BASE_POT}**. (Balance: {bal_new})",
+            icon="🎰",
         )
 
         emb = make_card(
             title="🎰 Word Pot — WIN",
             description=f"{user.mention} won **{pot} {EMO_SHEKEL()}** by solving **{ans}** on attempt **{attempt}**.",
             fields=[
-                ("Board", board, False),                          # <-- no code block
+                ("Board", board, False),
                 ("Next Pot", f"Resets to **{CASINO_BASE_POT}**", True),
             ],
             color=CARD_COLOR_SUCCESS,
@@ -1491,15 +1527,17 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
         origin_cid = game.get("origin_cid")
         _cleanup()
 
-        await safe_send(
-            channel,
-            f"❌ Out of tries. The word was **{ans}** — {quip}{f'\\n📖 Definition: {definition}' if definition else ''}\n"
-            f"The pot increases to **{new_pot} {EMO_SHEKEL()}**."
-        )
-
         fields = [("Board", board, False), ("Pot", f"Now **{new_pot} {EMO_SHEKEL()}**", True)]
         if definition:
             fields.append(("Definition", definition, False))
+
+        await send_boxed(
+            channel,
+            "🎰 Word Pot — Failed",
+            f"❌ The word was **{ans}** — {quip}",
+            icon="🎰",
+            fields=fields,
+        )
 
         emb = make_card(
             title="🎰 Word Pot — Failed",
@@ -1515,12 +1553,14 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
             pass
         return
 
-    # mid-game hint
+    # MID-GAME STATUS (box the legend)
     legend = legend_overview(game["legend"], game["guesses"])
     msg = f"Attempt **{attempt}/3** — solve within **3** to win the pot."
+    flds = [("Next", msg, False)]
     if legend:
-        msg += f"\n{legend}"
-    await safe_send(channel, msg)
+        flds.append(("Legend", legend, False))
+    await send_boxed(channel, "Word Pot — Status", "", icon="🎰", fields=flds)
+
 
 
 
@@ -2440,7 +2480,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 await _start_bounty_after_gate(guild, channel_id)
         return
 
-    # ---------- DUNGEON: join gate ----------
+    # ---------- DUNGEON: join gate (EDIT the original gate embed) ----------
     gate = pending_dungeon_gates_by_msg.get(payload.message_id)
     if gate and _dungeon_join_emoji_matches(payload.emoji):
         try:
@@ -2449,6 +2489,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             member = None
         if member and (not member.bot) and await is_worldler(guild, member):
             gate["participants"].add(member.id)
+
+            # Give the member access to the dungeon channel
             dch = guild.get_channel(gate["dungeon_channel_id"])
             if isinstance(dch, discord.TextChannel):
                 try:
@@ -2458,25 +2500,64 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                         g["participants"].add(member.id)
                     gmsg_id = g.get("welcome_msg_id") if g else None
                     if gmsg_id:
-                        msg = await dch.fetch_message(gmsg_id)
-                        names = []
-                        for uid in sorted(g["participants"]):
-                            try:
-                                mm = guild.get_member(uid) or await guild.fetch_member(uid)
-                                names.append(mm.mention if mm else f"<@{uid}>")
-                            except Exception:
-                                names.append(f"<@{uid}>")
-                        await msg.edit(content="🌀 **Dungeon — Tier {}**\nParticipants: {}\n\nWhen ready, the **owner** clicks 🔒 to start."
-                                       .format(g["tier"], ", ".join(names)))
+                        # Update the welcome message in the dungeon with the participant list
+                        try:
+                            msg = await dch.fetch_message(gmsg_id)
+                            names = []
+                            for uid in sorted(g["participants"]):
+                                try:
+                                    mm = guild.get_member(uid) or await guild.fetch_member(uid)
+                                    names.append(mm.mention if mm else f"<@{uid}>")
+                                except Exception:
+                                    names.append(f"<@{uid}>")
+                            # Rebuild a neat panel describing current participants
+                            emb = make_panel(
+                                title=f"Dungeon — Tier {g.get('tier')}",
+                                description="Gate is open. When ready, the **owner** clicks 🔒 to start.",
+                                fields=[("Participants", ", ".join(names) if names else "—", False)],
+                                icon="🌀",
+                            )
+                            await msg.edit(embed=emb)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
+
+            # EDIT the original gate message (in the gate channel) to include updated participants
             try:
                 gate_ch = guild.get_channel(gate["gate_channel_id"])
                 if isinstance(gate_ch, discord.TextChannel):
-                    m = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
-                    await gate_ch.send(f"{EMO_DUNGEON()} {m.mention} **joined the dungeon**.", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+                    try:
+                        gate_msg = await gate_ch.fetch_message(payload.message_id)
+                        # Build updated participants field
+                        part_names = []
+                        for uid in sorted(gate["participants"]):
+                            try:
+                                mm = guild.get_member(uid) or await guild.fetch_member(uid)
+                                if mm.id == gate.get("owner_id"):
+                                    part_names.append(f"{mm.mention} (owner)")
+                                else:
+                                    part_names.append(mm.mention)
+                            except Exception:
+                                part_names.append(f"<@{uid}>")
+                        desc = (
+                            f"Click {EMO_DUNGEON()} below **to join**. You’ll gain write access in "
+                            f"{dch.mention if isinstance(dch, discord.TextChannel) else 'the dungeon room'}.\n"
+                            f"When ready, the **owner** will **lock** the dungeon from inside to start the game."
+                        )
+                        emb = make_panel(
+                            title=f"{EMO_DUNGEON()} Dungeon Gate (Tier {gate.get('tier')})",
+                            description=desc,
+                            fields=[("Participants", ", ".join(part_names) if part_names else "—", False)],
+                            icon="🌀",
+                        )
+                        await gate_msg.edit(embed=emb)
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
+        # (No extra “joined” messages—cleaner gate.)
         return
 
     # ---------- DUNGEON: owner locks 🔒 to start ----------
@@ -2490,8 +2571,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             ch = guild.get_channel(ch_id)
             if isinstance(ch, discord.TextChannel):
                 # In-room notice
-                await ch.send("🔒 **Gate closed.** No further joins. The dungeon begins!")
-                # NEW: public announcement in the configured announcements channel
+                await send_boxed(ch, "Dungeon", "🔒 **Gate closed.** No further joins. The dungeon begins!", icon="🌀")
+                # Public announcement
                 try:
                     await _announce_result(
                         guild,
@@ -2512,13 +2593,14 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             if _continue_emoji_matches(payload.emoji):
                 game["decision_msg_id"] = None
                 if isinstance(ch, discord.TextChannel):
-                    await ch.send("⏩ **Continuing…**")
+                    await send_boxed(ch, "Dungeon", "⏩ **Continuing…**", icon="🌀")
                 await _dungeon_start_round(game)
                 return
             if _cashout_emoji_matches(payload.emoji):
                 pool = max(0, game.get("pool", 0))
                 await _dungeon_settle_and_close(game, pool, note="💰 **Cashed out in time.**")
                 return
+
 
 
 
@@ -2775,7 +2857,7 @@ async def _dungeon_settle_and_close(game: dict, payout_each: int, note: str):
 
 async def _dungeon_start_round(game: dict):
     # keep cumulative list across rounds
-    game.setdefault("solved_rounds", [])  # list[str] of solved ANSWERS (UPPER)
+    game.setdefault("solved_rounds", [])
     game["answer"] = _dungeon_new_answer()
     game["guesses"] = []
     game["legend"] = {}
@@ -2784,12 +2866,15 @@ async def _dungeon_start_round(game: dict):
 
     ch = discord.utils.get(bot.get_all_channels(), id=game["channel_id"])
     if isinstance(ch, discord.TextChannel):
-        await ch.send(
-            f"🗝️ **New Wordle begins!** Tier **{game['tier']}** — you have **{game['max']} tries**.\n"
-            f"Guess with `g APPLE` here."
+        await send_boxed(
+            ch,
+            "Dungeon — New Wordle",
+            f"Tier **{game['tier']}** — you have **{game['max']} tries**.\nGuess with `g APPLE` here.",
+            icon="🌀",
         )
         blank_board = render_board([], total_rows=game["max"])
-        await ch.send(blank_board)
+        await ch.send(blank_board)  # board plain
+
 
 
 
@@ -2799,21 +2884,21 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
     ch_id = channel.id
     game = dungeon_games.get(ch_id)
     if not game or game.get("state") not in ("active",):
-        await safe_send(channel, "No active dungeon round right now.")
+        await send_boxed(channel, "Dungeon", "No active dungeon round right now.", icon="🌀")
         return
     if author.id not in game["participants"]:
-        await safe_send(channel, f"{author.mention} you're not registered for this dungeon.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(channel, "Dungeon", f"{author.mention} you're not registered for this dungeon.", icon="🌀")
         return
 
     cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
     if len(cleaned) != 5:
-        await safe_send(channel, "Guess must be **exactly 5 letters**.")
+        await send_boxed(channel, "Invalid Guess", "Guess must be **exactly 5 letters**.", icon="❗")
         return
     if not is_valid_guess(cleaned):
-        await safe_send(channel, "That’s not in the Wordle dictionary (UK variants supported).")
+        await send_boxed(channel, "Invalid Guess", "That’s not in the Wordle dictionary (UK variants supported).", icon="📚")
         return
     if len(game["guesses"]) >= game["max"]:
-        await safe_send(channel, "Out of tries for this round.")
+        await send_boxed(channel, "Dungeon", "Out of tries for this round.", icon="🌀")
         return
 
     colors = score_guess(cleaned, game["answer"])
@@ -2821,7 +2906,7 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
     update_legend(game["legend"], cleaned, colors)
 
     board = render_board(game["guesses"], total_rows=game["max"])
-    await safe_send(channel, board)
+    await safe_send(channel, board)  # board plain
 
     attempt = len(game["guesses"])
     if cleaned == game["answer"]:
@@ -2835,7 +2920,7 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
         except Exception:
             pass
 
-        # Loot: 40% stone, 10% ticket down-tier (T3->T2, T2->T1)
+        # Loot: chances remain the same
         loot_msgs = []
         if random.random() < 0.40:
             await change_stones(game["guild_id"], author.id, 1)
@@ -2849,11 +2934,15 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
 
         legend = legend_overview(game["legend"])
         extra = f" 🎁 Loot: {' · '.join(loot_msgs)}" if loot_msgs else ""
-        await safe_send(channel,
-            f"✅ **Solved on attempt {attempt}!** Added **+{gained} {EMO_SHEKEL()}** to the dungeon pool "
-            f"(now **{game['pool']}**).{extra}\n"
-            f"{legend}\n\n"
-            f"**Owner**: react **⏩** to **Continue** or **💰** to **Cash Out** for everyone."
+        fields = [("Pool", f"Added **+{gained} {EMO_SHEKEL()}** (now **{game['pool']}**).", True)]
+        if legend:
+            fields.append(("Legend", legend, False))
+        await send_boxed(
+            channel,
+            f"✅ Solved on attempt {attempt}!",
+            f"**Owner**: react **⏩** to **Continue** or **💰** to **Cash Out** for everyone.{extra}",
+            icon="🌀",
+            fields=fields,
         )
         msg = await safe_send(channel, "⏩ Continue or 💰 Cash Out?")
         try:
@@ -2874,9 +2963,11 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
     next_attempt = attempt + 1
     payout = payout_for_attempt(next_attempt) * _dungeon_mult_for_tier(game["tier"])
     hint = legend_overview(game["legend"])
-    txt = f"Attempt **{attempt}/{game['max']}** — Solve on attempt **{next_attempt}** to add **+{payout}** to the pool."
-    if hint: txt += f"\n{hint}"
-    await safe_send(channel, txt)
+    flds = [("Next", f"Attempt **{attempt}/{game['max']}** — Solve on attempt **{next_attempt}** to add **+{payout}** to the pool.", False)]
+    if hint:
+        flds.append(("Legend", hint, False))
+    await send_boxed(channel, "Dungeon — Status", "", icon="🌀", fields=flds)
+
 
 
 
@@ -2925,7 +3016,7 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         else:        await change_dungeon_tickets_t1(gid, uid, +1)
         return await inter.followup.send("Couldn't create the dungeon channel (ticket refunded).")
 
-    # Register game (track origin_cid for announcements later)
+    # Register game
     dungeon_games[ch.id] = {
         "guild_id": gid,
         "channel_id": ch.id,
@@ -2935,17 +3026,22 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         "state": "await_start",
         "answer": None, "guesses": [], "max": _dungeon_max_for_tier(t), "legend": {}, "pool": 0,
         "gate_msg_id": None, "welcome_msg_id": None, "decision_msg_id": None,
-        "origin_cid": inter.channel.id,  # <— used by _announce_result at the end
-        "solved_words": [],              # <— NEW: keep a history of solved words
+        "origin_cid": inter.channel.id,
+        "solved_words": [],
     }
 
-    # Gate message in current channel (to join)
-    join_msg = await inter.channel.send(
-        f"{EMO_DUNGEON()} **Dungeon Gate (Tier {t}) opened by {inter.user.mention}!**\n"
-        f"Click {EMO_DUNGEON()} below **to join**. You’ll gain write access in {ch.mention}.\n"
-        f"When ready, the owner will **lock** the dungeon from inside to start the game.",
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+    # Gate message in current channel (boxed) with dynamic participants list
+    part_txt = f"<@{uid}> (owner)"
+    gate_embed = make_panel(
+        title=f"{EMO_DUNGEON()} Dungeon Gate (Tier {t})",
+        description=(
+            f"Click {EMO_DUNGEON()} below **to join**. You’ll gain write access in {ch.mention}.\n"
+            f"When ready, the **owner** will **lock** the dungeon from inside to start the game."
+        ),
+        fields=[("Participants", part_txt, False)],
+        icon="🌀",
     )
+    join_msg = await inter.channel.send(embed=gate_embed)
     try:
         await join_msg.add_reaction(EMO_DUNGEON())
     except Exception:
@@ -2962,7 +3058,7 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         "state": "gate_open",
     }
 
-    # Spooky welcome in dungeon channel with lock control
+    # Spooky welcome in dungeon channel (boxed) with lock control
     welcome_txt = (
         "🕯️ **Welcome, adventurers…**\n"
         "The air is cold and the walls whisper letters you cannot see.\n"
@@ -2970,17 +3066,31 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         f"**Tier {t}**: rewards multiplier ×{_dungeon_mult_for_tier(t)}, tries **{_dungeon_max_for_tier(t)}** per Wordle.\n"
         "When everyone has joined, the **owner** must click **🔒** below to seal the gate and begin."
     )
-    welcome = await ch.send(
-        f"🌀 **Dungeon — Tier {t}**\nParticipants: <@{uid}> (owner)\n\n{welcome_txt}",
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+    welcome = await send_boxed(
+        ch,
+        f"Dungeon — Tier {t}",
+        f"Participants: <@{uid}> (owner)\n\n{welcome_txt}",
+        icon="🌀",
     )
+    # welcome is a Message returned by send_boxed via safe_send path; get id:
     try:
-        await welcome.add_reaction("🔒")
+        # Retrieve the actual message to add reaction
+        if isinstance(welcome, discord.Message):
+            welcome_msg = welcome
+        else:
+            welcome_msg = await ch.fetch_message(ch.last_message_id)
     except Exception:
-        pass
+        welcome_msg = None
+
+    if welcome_msg:
+        try:
+            await welcome_msg.add_reaction("🔒")
+        except Exception:
+            pass
+
+        dungeon_games[ch.id]["welcome_msg_id"] = welcome_msg.id
 
     dungeon_games[ch.id]["gate_msg_id"] = join_msg.id
-    dungeon_games[ch.id]["welcome_msg_id"] = welcome.id
 
     await inter.followup.send(f"Opened {ch.mention} and posted a **join gate** here. Players must react {EMO_DUNGEON()} to join.")
 
