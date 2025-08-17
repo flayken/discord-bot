@@ -30,8 +30,15 @@ EMO_STONE_NAME   = os.getenv("WW_STONE_NAME",   "ww_stone")
 EMO_SNIPER_NAME  = os.getenv("WW_SNIPER_NAME",  "ww_sniper")
 EMO_BOUNTY_NAME  = os.getenv("WW_BOUNTY_NAME",  "ww_bounty")
 
+EMO_T1_TICKET_NAME = os.getenv("WW_T1_TICKET_NAME", "ww_t1_gate_scroll")
+EMO_T2_TICKET_NAME = os.getenv("WW_T2_TICKET_NAME", "ww_t2_gate_scroll")
+EMO_T3_TICKET_NAME = os.getenv("WW_T3_TICKET_NAME", "ww_t3_gate_scroll")
+
+
+
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
+INTENTS.emojis_and_stickers = True
 bot = discord.Client(intents=INTENTS)
 tree = app_commands.CommandTree(bot)
 
@@ -91,12 +98,105 @@ def get_named_emoji(name: str) -> str:
     e = discord.utils.find(lambda em: em.name.lower() == name.lower(), bot.emojis)
     return str(e) if e else ""
 
-EMO_BADGE   = lambda: (get_named_emoji(EMO_BADGE_NAME)   or "🎖️")
-EMO_CHICKEN = lambda: (get_named_emoji(EMO_CHICKEN_NAME) or "🍗")
-EMO_SHEKEL  = lambda: (get_named_emoji(EMO_SHEKEL_NAME)  or "🪙")
-EMO_STONE   = lambda: (get_named_emoji(EMO_STONE_NAME)   or "🪨")
-EMO_SNIPER  = lambda: (get_named_emoji(EMO_SNIPER_NAME)  or "🎯")
-EMO_BOUNTY  = lambda: (get_named_emoji(EMO_BOUNTY_NAME)  or "🎯")
+# -------------------- emoji helpers --------------------
+# ENV: names and optional IDs (IDs win if set)
+EMO_BADGE_NAME   = os.getenv("WW_BADGE_NAME",   "ww_badge")
+EMO_CHICKEN_NAME = os.getenv("WW_CHICKEN_NAME", "ww_chicken")
+EMO_SHEKEL_NAME  = os.getenv("WW_SHEKEL_NAME",  "ww_shekel")
+EMO_STONE_NAME   = os.getenv("WW_STONE_NAME",   "ww_stone")
+EMO_SNIPER_NAME  = os.getenv("WW_SNIPER_NAME",  "ww_sniper")
+EMO_BOUNTY_NAME  = os.getenv("WW_BOUNTY_NAME",  "ww_bounty")
+
+EMO_BADGE_ID     = int(os.getenv("WW_BADGE_ID",   "0")) or None
+EMO_CHICKEN_ID   = int(os.getenv("WW_CHICKEN_ID", "0")) or None
+EMO_SHEKEL_ID    = int(os.getenv("WW_SHEKEL_ID",  "0")) or None
+EMO_STONE_ID     = int(os.getenv("WW_STONE_ID",   "0")) or None
+EMO_SNIPER_ID    = int(os.getenv("WW_SNIPER_ID",  "0")) or None
+EMO_BOUNTY_ID    = int(os.getenv("WW_BOUNTY_ID",  "0")) or None
+
+EMO_T1_TICKET_ID = int(os.getenv("WW_T1_TICKET_ID", "0")) or None
+EMO_T2_TICKET_ID = int(os.getenv("WW_T2_TICKET_ID", "0")) or None
+EMO_T3_TICKET_ID = int(os.getenv("WW_T3_TICKET_ID", "0")) or None
+
+UNICODE_FALLBACK = {
+    "badge":   "🏅",
+    "chicken": "🍗",
+    "shekel":  "🪙",
+    "stone":   "🪨",
+    "sniper":  "🎯",
+    "bounty":  "🏴‍☠️",
+    "dungeon": "📚",
+}
+
+
+# --- Per-tier ticket emoji helpers (uses env NAMEs, falls back to 📜) ---
+
+def _emoji_from_env_name(env_var: str, fallback: str = "📜") -> str:
+    """Resolve a custom emoji by its NAME from .env; return fallback if not found."""
+    name = os.getenv(env_var, "").strip()
+    if not name:
+        return fallback
+    e = discord.utils.find(lambda em: (em.name or "").lower() == name.lower(), bot.emojis)
+    return str(e) if e else fallback
+
+def EMO_T1_TICKET() -> str:
+    return _emoji_from_env_name("WW_T1_TICKET_NAME", "📜")
+
+def EMO_T2_TICKET() -> str:
+    return _emoji_from_env_name("WW_T2_TICKET_NAME", "📜")
+
+def EMO_T3_TICKET() -> str:
+    return _emoji_from_env_name("WW_T3_TICKET_NAME", "📜")
+
+
+def _emoji_by_id(eid: int | None) -> str | None:
+    if not eid: 
+        return None
+    e = discord.utils.get(bot.emojis, id=eid)
+    return str(e) if e else None
+
+def _emoji_by_name(name: str) -> str | None:
+    if not name:
+        return None
+    e = discord.utils.find(lambda em: (em.name or "").lower() == name.lower(), bot.emojis)
+    return str(e) if e else None
+
+def _resolve_emoji(name: str, eid: int | None, *, fallback: str) -> str:
+    return _emoji_by_id(eid) or _emoji_by_name(name) or fallback
+
+def EMO_BADGE()   -> str: return _resolve_emoji(EMO_BADGE_NAME,   EMO_BADGE_ID,   fallback=UNICODE_FALLBACK["badge"])
+def EMO_CHICKEN() -> str: return _resolve_emoji(EMO_CHICKEN_NAME, EMO_CHICKEN_ID, fallback=UNICODE_FALLBACK["chicken"])
+def EMO_SHEKEL()  -> str: return _resolve_emoji(EMO_SHEKEL_NAME,  EMO_SHEKEL_ID,  fallback=UNICODE_FALLBACK["shekel"])
+def EMO_STONE()   -> str: return _resolve_emoji(EMO_STONE_NAME,   EMO_STONE_ID,   fallback=UNICODE_FALLBACK["stone"])
+def EMO_SNIPER()  -> str: return _resolve_emoji(EMO_SNIPER_NAME,  EMO_SNIPER_ID,  fallback=UNICODE_FALLBACK["sniper"])
+def EMO_BOUNTY()  -> str: return _resolve_emoji(EMO_BOUNTY_NAME,  EMO_BOUNTY_ID,  fallback=UNICODE_FALLBACK["bounty"])
+
+
+
+# Dungeon icon (you already had a separate helper — keep compatibility)
+EMO_DUNGEON_NAME = os.getenv("WW_DUNGEON_NAME", "ww_dungeon")
+EMO_DUNGEON_ID   = int(os.getenv("WW_DUNGEON_ID", "0")) or None
+def EMO_DUNGEON() -> str:
+    return _resolve_emoji(EMO_DUNGEON_NAME, EMO_DUNGEON_ID, fallback=UNICODE_FALLBACK["dungeon"])
+
+# Optional: log what we resolved at ready
+def _log_named_emojis():
+    pairs = [
+        ("badge",   EMO_BADGE()),
+        ("chicken", EMO_CHICKEN()),
+        ("shekel",  EMO_SHEKEL()),
+        ("stone",   EMO_STONE()),
+        ("sniper",  EMO_SNIPER()),
+        ("bounty",  EMO_BOUNTY()),
+        ("dungeon", EMO_DUNGEON()),
+        ("t1_ticket", EMO_T1_TICKET()),
+        ("t2_ticket", EMO_T2_TICKET()),
+        ("t3_ticket", EMO_T3_TICKET()),
+
+    ]
+    pretty = ", ".join(f"{k}={v or 'NONE'}" for k, v in pairs)
+    log.info(f"[emoji] named: {pretty}")
+
 
 # -------------------- deps sanity --------------------
 def log_deps_health():
@@ -510,9 +610,10 @@ def _loot_lines_for_tier(tier: int) -> list[str]:
     """
     lines = [f"• +1 {EMO_STONE()} on every solved word"]
     if tier == 3:
-        lines.append("• 10% chance per solve → +1 Tier 2 Ticket")
+      lines.append(f"• 10% chance per solve → +1 {EMO_T2_TICKET()} Tier 2 Ticket")
     elif tier == 2:
-        lines.append("• 10% chance per solve → +1 Tier 1 Ticket")
+      lines.append(f"• 10% chance per solve → +1 {EMO_T1_TICKET()} Tier 1 Ticket")
+
     return lines
 
 async def _ticket_count_for(gid: int, uid: int, tier: int) -> int:
@@ -2281,8 +2382,15 @@ class ShopView(discord.ui.View):
         self.guild_id = inter.guild.id
         self.message: Optional[discord.Message] = None  # set by /shop after send
 
-        def add_buy_btn(key: str, label: str, emoji: str, style: discord.ButtonStyle):
-            btn = discord.ui.Button(label=label, emoji=emoji, style=style)
+        def _as_btn_emoji(e: str):
+            # Works for both custom "<:name:id>" and unicode
+            try:
+                return discord.PartialEmoji.from_str(e) if e and e.startswith("<") else e
+            except Exception:
+                return e  # fallback to string (unicode)
+
+        def add_buy_btn(key: str, label: str, emoji_str: str, style: discord.ButtonStyle):
+            btn = discord.ui.Button(label=label, emoji=_as_btn_emoji(emoji_str), style=style)
 
             async def _cb(i: discord.Interaction, _key=key, _label=label):
                 if i.user.id != self.owner_id:
@@ -2301,12 +2409,12 @@ class ShopView(discord.ui.View):
             btn.callback = _cb
             self.add_item(btn)
 
-        # Buy buttons
-        add_buy_btn("stone",     "Stone",     EMO_STONE(),   discord.ButtonStyle.primary)
-        add_buy_btn("badge",     "Badge",     EMO_BADGE(),   discord.ButtonStyle.secondary)
-        add_buy_btn("chicken",   "Chicken",   EMO_CHICKEN(), discord.ButtonStyle.secondary)
-        add_buy_btn("sniper",    "Sniper",    EMO_SNIPER(),  discord.ButtonStyle.secondary)
-        add_buy_btn("ticket_t3", "T3 Ticket", EMO_DUNGEON(), discord.ButtonStyle.success)
+        # Buy buttons (now using your custom emoji helpers)
+        add_buy_btn("stone",     "Stone",     EMO_STONE(),     discord.ButtonStyle.primary)
+        add_buy_btn("badge",     "Badge",     EMO_BADGE(),     discord.ButtonStyle.secondary)
+        add_buy_btn("chicken",   "Chicken",   EMO_CHICKEN(),   discord.ButtonStyle.secondary)
+        add_buy_btn("sniper",    "Sniper",    EMO_SNIPER(),    discord.ButtonStyle.secondary)
+        add_buy_btn("ticket_t3", "T3 Ticket", EMO_T3_TICKET(), discord.ButtonStyle.success)  # <-- tier-specific scroll
 
         # SELL (red) — replaces this message with the Sell menu
         sell_btn = discord.ui.Button(label="Sell", emoji="💸", style=discord.ButtonStyle.danger)
@@ -2331,6 +2439,14 @@ class ShopView(discord.ui.View):
                 await self.message.edit(view=self)
         except Exception:
             pass
+
+
+
+
+
+
+
+
 
 
 
@@ -4204,6 +4320,7 @@ PRICE_SNIPER = 100
 SNIPER_SNIPE_COST = 1  # price per snipe shot
 
 # NEW: Tier 3 Dungeon Ticket is purchasable (T2/T1 are loot-only)
+# NEW: Tier 3 Dungeon Ticket is purchasable (T2/T1 are loot-only)
 SHOP_ITEMS = {
     "stone": {
         "label": f"{EMO_STONE()} Stone",
@@ -4225,13 +4342,14 @@ SHOP_ITEMS = {
         "price": PRICE_SNIPER,
         "desc": f"Lets you `/snipe` other players' solo Wordle (costs {SNIPER_SNIPE_COST} shekel per shot). One-time purchase.",
     },
-    # NEW ITEM
+    # NEW ITEM (now uses the tier-specific emoji)
     "ticket_t3": {
-        "label": f"{EMO_DUNGEON()} Dungeon Ticket (Tier 3)",
+        "label": f"{EMO_T3_TICKET()} Dungeon Ticket (Tier 3)",
         "price": 5,
         "desc": "Opens a Tier 3 Worldle Dungeon. Use `/worldle_dungeon tier:Tier 3`.",
     },
 }
+
 
 # Controls shop item order & /buy choices
 SHOP_ORDER = ["stone", "badge", "chicken", "sniper", "ticket_t3"]
@@ -5388,6 +5506,7 @@ async def on_ready():
         except Exception as e:
             log.warning(f"guild init {g.id} failed: {e}")
     build_emoji_lookup()
+    _log_named_emojis()
     try:
         await tree.sync()
         print("Global slash commands synced.")
