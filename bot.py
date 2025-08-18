@@ -85,6 +85,17 @@ BOUNTY_ROLE_NAME   = "Bounty Hunter"
 
 # -------------------- emoji helpers --------------------
 
+def EMO_GATE_SCROLL(tier: int) -> str:
+    """Return the custom gate scroll emoji for a given tier (1‑3)."""
+    return get_named_emoji(f"ww_t{tier}_gate_scroll")
+
+EMO_BADGE   = lambda: "<:ww_badge:1404182337230602343>"
+EMO_CHICKEN = lambda: "<:ww_chicken:1406752722002120704>"
+EMO_SHEKEL  = lambda: "<:ww_shekel:1406746588831027353>"
+EMO_STONE   = lambda: "<:ww_stone:1406746605842862100>"
+EMO_SNIPER  = lambda: "<:ww_sniper:1406747636429754508>"
+EMO_BOUNTY  = lambda: "<:ww_bounty:1406783901032251492>"
+EMO_DUNGEON = lambda: get_named_emoji("ww_gate")  # custom WW gate emoji
 
 
 def get_named_emoji(name: str) -> str:
@@ -97,7 +108,7 @@ EMO_SHEKEL  = lambda: "<:ww_shekel:1406746588831027353>"
 EMO_STONE   = lambda: "<:ww_stone:1406746605842862100>"
 EMO_SNIPER  = lambda: "<:ww_sniper:1406747636429754508>"
 EMO_BOUNTY  = lambda: "<:ww_bounty:1406783901032251492>"
-EMO_DUNGEON = lambda: "<:ww_t3_gate_scroll:1406748502649733190>"
+EMO_DUNGEON  = lambda: "<:ww_t3_gate_scroll:1406748502649733190>"
 
 # -------------------- deps sanity --------------------
 def log_deps_health():
@@ -576,8 +587,6 @@ async def _build_dungeon_embed(gid: int, uid: int, page: str) -> discord.Embed:
     )
 
 
-import asyncio  # make sure this import exists near your other imports
-
 class DungeonView(discord.ui.View):
     """4-page dungeon guide; Enter button calls /worldle_dungeon and live-updates ticket count.
        On the Rules page the Enter button is removed entirely.
@@ -589,6 +598,15 @@ class DungeonView(discord.ui.View):
         self.user_id = inter.user.id
         self.page = f"t{start_tier}"  # 't1' | 't2' | 't3' | 'rules'
         self.message: discord.Message | None = None  # set by the command after sending
+
+        # Attach custom gate scroll emojis to navigation + action buttons
+        for t, btn in ((1, self.t1_button), (2, self.t2_button), (3, self.t3_button)):
+            emo = EMO_GATE_SCROLL(t)
+            if emo:
+                btn.emoji = emo
+        emo = EMO_GATE_SCROLL(start_tier)
+        if emo:
+            self.enter_button.emoji = emo
 
     # ---------- internal helpers ----------
     def _current_tier(self) -> int:
@@ -620,6 +638,9 @@ class DungeonView(discord.ui.View):
             count = await _ticket_count_for(self.guild_id, self.user_id, t)
             self.enter_button.label = f"Enter Dungeon — T{t} ({count} tickets)"
             self.enter_button.disabled = (count <= 0)
+            emo = EMO_GATE_SCROLL(t)
+            if emo:
+                self.enter_button.emoji = emo
 
         # Push UI
         if i is not None:
@@ -677,6 +698,7 @@ class DungeonView(discord.ui.View):
         # A tiny yield lets anything deferred finish updating your storage.
         await asyncio.sleep(0)
         await self.refresh_page()  # edits self.message with new ticket count
+
 
 
 
