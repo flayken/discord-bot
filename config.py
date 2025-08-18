@@ -1,62 +1,50 @@
-# worldle_bot/core/config.py
-"""
-Global configuration and constants for the Worldle bot.
-Central place for emojis, role names, cooldowns, and tokens.
-"""
+# -------------------- basic setup --------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("wordle")
 
-import os
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-# -------------------------------------------------------------------
-# Discord Token
-# -------------------------------------------------------------------
-TOKEN = os.getenv("DISCORD_TOKEN")  # fallback handled in main.py
+DB_PATH = os.getenv("DB_PATH", "wordle_world.db")
+START_BONUS = int(os.getenv("START_BONUS", "5"))
 
-# -------------------------------------------------------------------
-# Roles / Access
-# -------------------------------------------------------------------
-WORLDLER_ROLE_NAME = "Worldler"  # change if your bot uses a different role
+# Named item emoji ENV (custom emoji in your emoji server)
+EMO_BADGE_NAME   = os.getenv("WW_BADGE_NAME",   "ww_badge")
+EMO_CHICKEN_NAME = os.getenv("WW_CHICKEN_NAME", "ww_chicken")
+EMO_SHEKEL_NAME  = os.getenv("WW_SHEKEL_NAME",  "ww_shekel")
+EMO_STONE_NAME   = os.getenv("WW_STONE_NAME",   "ww_stone")
+EMO_SNIPER_NAME  = os.getenv("WW_SNIPER_NAME",  "ww_sniper")
+EMO_BOUNTY_NAME  = os.getenv("WW_BOUNTY_NAME",  "ww_bounty")
 
-# -------------------------------------------------------------------
-# Emoji names (these get resolved at runtime via build_emoji_lookup)
-# You had functions like EMO_SHEKEL(), EMO_STONE(), etc.
-# Keep just the *names* here.
-# -------------------------------------------------------------------
-EMO_BADGE_NAME = "ww_badge"
-EMO_CHICKEN_NAME = "ww_chicken"
-EMO_SNIPER_NAME = "ww_sniper"
-EMO_BOUNTY_NAME = "ww_bounty"
-EMO_SHEKEL_NAME = "ww_shekel"
-EMO_STONE_NAME = "ww_stone"
+INTENTS = discord.Intents.default()
+INTENTS.message_content = True
+bot = discord.Client(intents=INTENTS)
+tree = app_commands.CommandTree(bot)
 
-# -------------------------------------------------------------------
-# Economy
-# -------------------------------------------------------------------
-SHEKEL_DROP_CHANCE = 0.10   # 10% chance per slot
-SHEKEL_DROP_MIN = 1
-SHEKEL_DROP_MAX = 5
 
-# -------------------------------------------------------------------
-# Bounty System
-# -------------------------------------------------------------------
-BOUNTY_PAYOUT = 50
-BOUNTY_ARM_DELAY_S = 60     # 1 minute
-BOUNTY_EXPIRE_MIN = 15
-BOUNTY_EXPIRE_S = BOUNTY_EXPIRE_MIN * 60
+# Ambient shekel drop config (per-guild, one roll per 20-min slot)
+SHEKEL_DROP_CHANCE = float(os.getenv("SHEKEL_DROP_CHANCE", "0.10"))  # 10% chance
+SHEKEL_DROP_MIN    = int(os.getenv("SHEKEL_DROP_MIN", "1"))
+SHEKEL_DROP_MAX    = int(os.getenv("SHEKEL_DROP_MAX", "5"))
+if SHEKEL_DROP_MIN > SHEKEL_DROP_MAX:
+    SHEKEL_DROP_MIN, SHEKEL_DROP_MAX = SHEKEL_DROP_MAX, SHEKEL_DROP_MIN
 
-# -------------------------------------------------------------------
-# Dungeon
-# -------------------------------------------------------------------
-DUNGEON_TICKET_COST = 10
-DUNGEON_MAX_ROUNDS = 5
 
-# -------------------------------------------------------------------
-# Cooldowns
-# -------------------------------------------------------------------
-DAILY_RESET_HOUR = 0  # UK time reset
-PRAY_REWARD = 5
-BEG_REWARD = 5
 
-# -------------------------------------------------------------------
-# Other toggles
-# -------------------------------------------------------------------
-DEFAULT_TIERS = True  # whether to auto-create tiers on guild join
+# -------------------- state --------------------
+solo_games: dict[Tuple[int,int,int], dict] = {}     # (gid, cid, uid) -> {answer, guesses[], max, legend, origin_cid}
+bounty_games: dict[int, dict] = {}                  # gid -> {answer, channel_id, started_at}
+pending_bounties: dict[int, dict] = {}              # gid -> {message_id, channel_id, users:set, hour_idx}
+duels: dict[int, dict] = {}                         # duel_id -> data
+_next_duel_id = 1
+solo_channels: dict[Tuple[int,int], int] = {}       # (gid, uid) -> channel_id
+
+# NEW: Casino (Word Pot)
+casino_games: dict[Tuple[int,int,int], dict] = {}   # (gid, cid, uid) -> {answer, guesses[], max=3, legend, origin_cid, staked:int}
+casino_channels: dict[Tuple[int,int], int] = {}     # (gid, uid) -> channel_id
+
+
+# -------------------- GLOBALS --------------------
+
+# ---- Dailies panel state (place near other globals) ----
+dailies_msg_ids: set[int] = set()   # message IDs of active /dailies panels
