@@ -1,37 +1,40 @@
 # worldle_bot/features/bounty.py
 """
-Bounty feature: hourly bounty prompts, arming, and guess handling.
+Bounty feature:
+ - Hourly bounty prompts
+ - Arming and starting bounties
+ - Handling bounty guesses
 """
 
 import random
-import logging
 import discord
+from discord.ext import commands
 
-from ..core.utils import safe_send, make_panel
-from ..core.config import (
-    EMO_BOUNTY, EMO_BOUNTY_NAME,
-    EMO_SHEKEL,
-    BOUNTY_ARM_DELAY_S, BOUNTY_PAYOUT,
-    BOUNTY_EXPIRE_MIN, BOUNTY_EXPIRE_S,
-)
+from ..core.utils import safe_send, make_panel, gmt_now_s, log
 from ..core.db import get_cfg, set_cfg
 from ..features.roles import ensure_bounty_role
+from ..core.config import (
+    EMO_BOUNTY,
+    EMO_BOUNTY_NAME,
+    EMO_SHEKEL,
+    BOUNTY_ARM_DELAY_S,
+    BOUNTY_PAYOUT,
+    BOUNTY_EXPIRE_MIN,
+    BOUNTY_EXPIRE_S,
+    ANSWERS,
+)
 
-log = logging.getLogger("worldle_bot")
+bot: commands.Bot  # injected in main.py
 
-# Track current bounties and games
+# Track active and pending bounties
 pending_bounties: dict[int, dict] = {}
 bounty_games: dict[int, dict] = {}
-
-# Answers pool (imported from your original word list)
-ANSWERS: list[str] = ["apple", "grape", "melon", "peach"]  # TODO: replace with full word list
 
 
 # -------------------------------------------------------------------
 # Utility
 # -------------------------------------------------------------------
 def _bounty_emoji_matches(emoji: discord.PartialEmoji) -> bool:
-    """Check if emoji matches bounty emoji config."""
     target_name = (EMO_BOUNTY_NAME or "ww_bounty").lower()
     if emoji.is_unicode_emoji():
         return emoji.name == "🎯"
@@ -39,9 +42,8 @@ def _bounty_emoji_matches(emoji: discord.PartialEmoji) -> bool:
 
 
 async def _find_bounty_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    """Pick bounty channel: config → system → first writable channel."""
     cfg = await get_cfg(guild.id)
-    if cfg.get("bounty_channel_id"):
+    if cfg["bounty_channel_id"]:
         ch = guild.get_channel(cfg["bounty_channel_id"])
         if isinstance(ch, discord.TextChannel) and ch.permissions_for(guild.me).send_messages:
             return ch
@@ -54,15 +56,15 @@ async def _find_bounty_channel(guild: discord.Guild) -> discord.TextChannel | No
 
 
 # -------------------------------------------------------------------
-# Posting bounty prompt
+# Post prompt
 # -------------------------------------------------------------------
 async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel, hour_idx: int):
-    """Post bounty prompt message."""
     if guild.id in pending_bounties or guild.id in bounty_games:
         return False
 
     cfg = await get_cfg(guild.id)
     suppress_ping = int(cfg.get("suppress_bounty_ping", 0)) == 1
+
     rid = await ensure_bounty_role(guild)
     em = EMO_BOUNTY()
     role_mention = "" if suppress_ping else (f"<@&{rid}>" if rid else "")
@@ -97,27 +99,26 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
         "channel_id": channel.id,
         "users": set(),
         "hour_idx": hour_idx,
-        "expires_at": discord.utils.utcnow().timestamp() + BOUNTY_EXPIRE_S,
+        "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
     }
     await set_cfg(guild.id, last_bounty_hour=hour_idx)
     return True
 
 
 # -------------------------------------------------------------------
-# Arming bounty
+# Start after gate
 # -------------------------------------------------------------------
 async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int):
-    """Start bounty game after 2 players react."""
     if guild.id in bounty_games:
         return
     answer = random.choice(ANSWERS)
     bounty_games[guild.id] = {
         "answer": answer,
         "channel_id": channel_id,
-        "started_at": discord.utils.utcnow().timestamp(),
-        "expires_at": discord.utils.utcnow().timestamp() + BOUNTY_EXPIRE_S,
+        "started_at": gmt_now_s(),
+        "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
     }
-    await set_cfg(guild.id, last_bounty_ts=discord.utils.utcnow().timestamp(), suppress_bounty_ping=0)
+    await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0)
     ch = guild.get_channel(channel_id)
     if isinstance(ch, discord.TextChannel):
         emb = make_panel(
