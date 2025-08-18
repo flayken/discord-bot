@@ -782,15 +782,9 @@ async def _build_sell_embed(gid: int, uid: int, owned: list[dict]) -> discord.Em
 
 
 async def _get_owned_sellables(gid: int, uid: int) -> list[dict]:
-    """
-    Return a list of items the user can sell, each as:
-      { key, label, count, price_each, emoji }
-    Only include items with count > 0.
-    """
-    # Pull counts
     stones   = await get_stones(gid, uid)
-    chickens = await get_chickens(gid, uid)
     badge    = await get_badge(gid, uid)
+    chickens = await get_chickens(gid, uid)
     sniper   = await get_sniper(gid, uid)
     t3       = await get_dungeon_tickets_t3(gid, uid)
 
@@ -809,14 +803,14 @@ async def _get_owned_sellables(gid: int, uid: int) -> list[dict]:
     _add("badge",     badge,    "Bounty Hunter Badge",     SHOP_ITEMS["badge"]["price"],     EMO_BADGE())
     _add("chicken",   chickens, "Fried Chicken",           SHOP_ITEMS["chicken"]["price"],   EMO_CHICKEN())
     _add("sniper",    sniper,   "Sniper",                  SHOP_ITEMS["sniper"]["price"],    EMO_SNIPER())
-    _add("ticket_t3", t3,       "Dungeon Ticket (Tier 3)", SHOP_ITEMS["ticket_t3"]["price"], EMO_DUNGEON())
+    _add("ticket_t3", t3,       "Dungeon Ticket (Tier 3)", SHOP_ITEMS["ticket_t3"]["price"], EMO_GATE_SCROLL(3))
     return catalog
 
 
+
 async def _shop_perform_sell(i: discord.Interaction, key: str, qty: int):
-    """
-    Performs a SELL and replies PUBLICLY (non-ephemeral) on both success and errors.
-    Mirrors the logic of the /sell command, but as a reusable helper for UI.
+    """Performs a SELL and replies PUBLICLY (non-ephemeral) on both success and errors.
+       Mirrors the logic of the /sell command, but as a reusable helper for UI.
     """
     async def _send(msg: str):
         return await send_boxed(i, "Shop — Sell", msg, icon="🛍️", ephemeral=False)
@@ -844,44 +838,35 @@ async def _shop_perform_sell(i: discord.Interaction, key: str, qty: int):
     # Badge (one-time)
     if key == "badge":
         have = await get_badge(gid, uid)
-        if have < 1 or qty != 1:
-            return await _send("You can only sell **one** Bounty Hunter Badge if you own it.")
-        await set_badge(gid, uid, 0)
-        refund = SHOP_ITEMS["badge"]["price"]
+        if have < qty:
+            return await _send("You don't have that many badges to sell.")
+        await change_badge(gid, uid, -qty)
+        refund = SHOP_ITEMS["badge"]["price"] * qty
         await change_balance(gid, uid, refund, announce_channel_id=cid)
-        # Remove bounty role if present
-        try:
-            rid = (await get_cfg(gid))["bounty_role_id"]
-            role = i.guild.get_role(rid) if rid else None
-            member = i.guild.get_member(uid) or await i.guild.fetch_member(uid)
-            if role and member and bot_can_manage_role(i.guild, role):
-                await member.remove_roles(role, reason="Sold Bounty Hunter Badge")
-        except Exception as e:
-            log.warning(f"sell badge role removal failed: {e}")
         bal = await get_balance(gid, uid)
-        return await _send(f"Sold **{EMO_BADGE()} Bounty Hunter Badge** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+        return await _send(f"Sold **{qty}× {EMO_BADGE()} Badge** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
 
     # Chicken
     if key == "chicken":
         have = await get_chickens(gid, uid)
         if have < qty:
-            return await _send("You don't have that many fried chicken to sell.")
+            return await _send("You don't have that many chickens to sell.")
         await change_chickens(gid, uid, -qty)
         refund = SHOP_ITEMS["chicken"]["price"] * qty
         await change_balance(gid, uid, refund, announce_channel_id=cid)
         bal = await get_balance(gid, uid)
-        return await _send(f"Sold **{qty}× {EMO_CHICKEN()} Fried Chicken** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+        return await _send(f"Sold **{qty}× {EMO_CHICKEN()} Chicken** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
 
-    # Sniper (one-time)
+    # Sniper
     if key == "sniper":
         have = await get_sniper(gid, uid)
-        if have < 1 or qty != 1:
-            return await _send("You can only sell **one** Sniper if you own it.")
-        await set_sniper(gid, uid, 0)
-        refund = SHOP_ITEMS["sniper"]["price"]
+        if have < qty:
+            return await _send("You don't have that many snipers to sell.")
+        await change_sniper(gid, uid, -qty)
+        refund = SHOP_ITEMS["sniper"]["price"] * qty
         await change_balance(gid, uid, refund, announce_channel_id=cid)
         bal = await get_balance(gid, uid)
-        return await _send(f"Sold **{EMO_SNIPER()} Sniper** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+        return await _send(f"Sold **{qty}× {EMO_SNIPER()} Sniper** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
 
     # Tier-3 Ticket
     if key == "ticket_t3":
@@ -892,9 +877,10 @@ async def _shop_perform_sell(i: discord.Interaction, key: str, qty: int):
         refund = SHOP_ITEMS["ticket_t3"]["price"] * qty
         await change_balance(gid, uid, refund, announce_channel_id=cid)
         bal = await get_balance(gid, uid)
-        return await _send(f"Sold **{qty}× {EMO_DUNGEON()} Tier-3 Ticket** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+        return await _send(f"Sold **{qty}× {EMO_GATE_SCROLL(3)} Tier-3 Ticket** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
 
     return await _send("Can't sell that item here.")
+
 
 
 
@@ -2329,7 +2315,7 @@ class ShopView(discord.ui.View):
         add_buy_btn("badge",     "Badge",     EMO_BADGE(),   discord.ButtonStyle.secondary)
         add_buy_btn("chicken",   "Chicken",   EMO_CHICKEN(), discord.ButtonStyle.secondary)
         add_buy_btn("sniper",    "Sniper",    EMO_SNIPER(),  discord.ButtonStyle.secondary)
-        add_buy_btn("ticket_t3", "T3 Ticket", EMO_DUNGEON(), discord.ButtonStyle.success)
+        add_buy_btn("ticket_t3", "T3 Ticket", EMO_GATE_SCROLL(3), discord.ButtonStyle.success)
 
         # SELL (red) — replaces this message with the Sell menu
         sell_btn = discord.ui.Button(label="Sell", emoji="💸", style=discord.ButtonStyle.danger)
@@ -2354,6 +2340,7 @@ class ShopView(discord.ui.View):
                 await self.message.edit(view=self)
         except Exception:
             pass
+
 
 
 
