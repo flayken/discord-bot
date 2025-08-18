@@ -1,88 +1,69 @@
 # worldle_bot/features/bounty.py
-"""
-Hourly Bounty (GMT):
- - /worldle_bounty_setchannel   (admin) bind the bounty channel
- - /worldle_bounty_now          (admin) post a prompt immediately
- - /worldle_bounty_guess WORD   guess in the bounty channel when armed
-
-Behavior:
- - At the top of each GMT hour (first ~40s), post a "gate" prompt to the configured bounty channel.
- - Players react with the bounty emoji to "arm" the bounty. Needs 2 players.
- - After the 2nd player, the bounty arms in BOUNTY_ARM_DELAY_S (default 60s).
- - Once armed, infinite guesses allowed in the bounty channel, with a per-user cooldown.
- - Success pays BOUNTY_PAYOUT to the solver and announces.
- - If a pending prompt expires, or an armed bounty expires, +1 shekel to the Word Pot.
-
-Exports:
- - register(bot, tree): wire commands, listeners, and start the loop.
-"""
-
 from __future__ import annotations
 
 import random
-from typing import Optional, Dict, Any, Set
+from typing import Dict, Any, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from ..core.config import (
-    EMO_SHEKEL,
-    EMO_BOUNTY,
+    EMO_BOUNTY, EMO_SHEKEL,
     EMO_BOUNTY_NAME,
     ANSWERS,
 )
-from ..core.utils import (
-    make_panel,
-    make_card,
-    safe_send,
-    send_boxed,
-    is_worldler,
-    guard_worldler_inter,
-    gmt_now_s,
-    current_hour_index_gmt,
-)
 from ..core.db import (
-    get_cfg,
-    set_cfg,
-    get_casino_pot,
-    set_casino_pot,
     change_balance,
     inc_stat,
     get_balance,
+    get_casino_pot,
+    set_casino_pot,
+    get_cfg,
+    set_cfg,
+)
+from ..core.utils import (
+    guard_worldler_inter,
+    is_worldler,
+    send_boxed,
+    safe_send,
+    make_panel,
+    make_card,
+    score_guess,
+    is_valid_guess,
+    render_row,
+    gmt_now_s,
+    current_hour_index_gmt,
+    ensure_bounty_role,
 )
 
-from ..features.announce import announce_result  # thin wrapper for announcements channel
-
-
-# -------------------- module state --------------------
+# ---------------------------------------------------------------------
+# Module state
+# ---------------------------------------------------------------------
 bot: commands.Bot | None = None
 tree: app_commands.CommandTree | None = None
 
-# config knobs
+# Pending (gate) bounties: guild_id -> { message_id, channel_id, users:set, hour_idx, expires_at, arming_at? }
+pending_bounties: Dict[int, Dict[str, Any]] = {}
+
+# Armed bounties: guild_id -> { answer, channel_id, started_at, expires_at }
+bounty_games: Dict[int, Dict[str, Any]] = {}
+
+# Per-user cooldown on guesses: (guild_id, user_id) -> last_ts
+last_bounty_guess_ts: Dict[Tuple[int, int], int] = {}
+
+# Settings
 BOUNTY_PAYOUT = 5
 BOUNTY_EXPIRE_MIN = 59
 BOUNTY_EXPIRE_S = BOUNTY_EXPIRE_MIN * 60
-BOUNTY_ARM_DELAY_S = 60
-BOUNTY_GUESS_COOLDOWN_S = 5  # per-user
 
-# in-memory game state
-# guild_id -> pending gate info
-pending_bounties: Dict[int, Dict[str, Any]] = {}
-# guild_id -> active armed game
-bounty_games: Dict[int, Dict[str, Any]] = {}
-# (guild_id, user_id) -> last guess timestamp (per-user throttle)
-last_bounty_guess_ts: Dict[tuple[int, int], int] = {}
+BOUNTY_ARM_DELAY_S = 60              # wait 60s after 2 reactions before arming
+BOUNTY_GUESS_COOLDOWN_S = 5          # 5s per-user cooldown between guesses
 
 
-# -------------------- helpers --------------------
-def _bounty_emoji_matches(emoji: discord.PartialEmoji) -> bool:
-    target_name = (EMO_BOUNTY_NAME or "ww_bounty").lower()
-    if emoji.is_unicode_emoji():
-        return emoji.name == "🎯"
-    return (emoji.name or "").lower() == target_name
-
-
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
 async def _find_bounty_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     cfg = await get_cfg(guild.id)
     ch_id = cfg.get("bounty_channel_id")
@@ -98,19 +79,24 @@ async def _find_bounty_channel(guild: discord.Guild) -> Optional[discord.TextCha
     return None
 
 
+def _bounty_emoji_matches(emoji: discord.PartialEmoji) -> bool:
+    target_name = (EMO_BOUNTY_NAME or "ww_bounty").lower()
+    if emoji.is_unicode_emoji():
+        return emoji.name == "🎯"
+    return (emoji.name or "").lower() == target_name
+
+
 async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel, hour_idx: int) -> bool:
-    """Create a gate prompt if none pending/active for this guild. Returns True if posted."""
     if guild.id in pending_bounties or guild.id in bounty_games:
         return False
 
     cfg = await get_cfg(guild.id)
     suppress_ping = int(cfg.get("suppress_bounty_ping", 0)) == 1
 
-    # optional role ping — rely on roles.ensure_bounty_role to have created one
-    rid = cfg.get("bounty_role_id")  # roles.ensure_bounty_role should store this; else None
+    rid = await ensure_bounty_role(guild)
+    em = EMO_BOUNTY()
     role_mention = "" if suppress_ping else (f"<@&{rid}>" if rid else "")
 
-    em = EMO_BOUNTY()
     desc = (
         f"React with {em} to **arm** this bounty — need **2** players.\n"
         f"**After 2 react, the bounty arms in {BOUNTY_ARM_DELAY_S//60} minute.**\n"
@@ -120,13 +106,13 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
     )
     emb = make_panel(title=f"{em} Hourly Bounty (GMT)", description=desc)
 
-    # send (use message content for the ping so it actually notifies)
     msg = await safe_send(
         channel,
         content=role_mention or None,
         embed=emb,
         allowed_mentions=discord.AllowedMentions(users=False, roles=(not suppress_ping), everyone=False),
     )
+
     try:
         await msg.add_reaction(em)
     except Exception:
@@ -138,7 +124,7 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
     pending_bounties[guild.id] = {
         "message_id": msg.id,
         "channel_id": channel.id,
-        "users": set(),   # type: Set[int]
+        "users": set(),
         "hour_idx": hour_idx,
         "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
         "arming_at": None,
@@ -147,7 +133,7 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
     return True
 
 
-async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int):
+async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int) -> None:
     if guild.id in bounty_games:
         return
     answer = random.choice(ANSWERS)
@@ -157,8 +143,7 @@ async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int):
         "started_at": gmt_now_s(),
         "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
     }
-    # re-enable pings for next hour
-    await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0)
+    await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0)  # re-enable pings
     ch = guild.get_channel(channel_id)
     if isinstance(ch, discord.TextChannel):
         emb = make_panel(
@@ -171,35 +156,34 @@ async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int):
         await safe_send(ch, embed=emb)
 
 
-# -------------------- commands --------------------
+# ---------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------
 def _bind_commands(_tree: app_commands.CommandTree):
 
     @_tree.command(name="worldle_bounty_setchannel", description="(Admin) Set this channel for bounty drops.")
     @app_commands.default_permissions(administrator=True)
     async def worldle_bounty_setchannel(inter: discord.Interaction):
         if not inter.guild or not inter.channel:
-            return await send_boxed(inter, "Bounty", "Server only.", icon="🎯", ephemeral=True)
+            return await inter.response.send_message("Server only.", ephemeral=True)
         await set_cfg(inter.guild.id, bounty_channel_id=inter.channel.id)
-        await send_boxed(inter, "Bounty", f"Set bounty channel to {inter.channel.mention}.", icon="🎯")
+        await inter.response.send_message(f"✅ Set bounty channel to {inter.channel.mention}.")
 
-    @_tree.command(name="worldle_bounty_now", description="(Admin) Post a bounty prompt now (requires emoji arm).")
+    @_tree.command(name="worldle_bounty_now", description="(Admin) Post a bounty prompt **now** (requires emoji arm).")
     @app_commands.default_permissions(administrator=True)
     async def worldle_bounty_now(inter: discord.Interaction):
-        if not inter.guild:
-            return await send_boxed(inter, "Bounty", "Server only.", icon="🎯", ephemeral=True)
+        if not inter.guild or not inter.channel:
+            return await inter.response.send_message("Server only.", ephemeral=True)
         await inter.response.defer(thinking=False)
-
         if inter.guild.id in bounty_games:
-            return await safe_send(inter.channel, "There is already an active bounty.")
+            return await inter.followup.send("There is already an active bounty.")
         if inter.guild.id in pending_bounties:
-            return await safe_send(inter.channel, "There is already a pending bounty prompt.")
-
+            return await inter.followup.send("There is already a pending bounty prompt.")
         ch = await _find_bounty_channel(inter.guild)
         if not ch:
-            return await safe_send(inter.channel, "I can't find a channel I can speak in.")
-
+            return await inter.followup.send("I can't find a channel I can speak in.")
         ok = await _post_bounty_prompt(inter.guild, ch, current_hour_index_gmt())
-        await safe_send(inter.channel, "🎯 Bounty prompt posted — needs 2 reactions to arm." if ok else "Couldn't post a bounty prompt.")
+        await inter.followup.send("🎯 Bounty prompt posted — needs 2 reactions to arm." if ok else "Couldn't post a bounty prompt.")
 
     @_tree.command(name="worldle_bounty_guess", description="Guess the active bounty word.")
     @app_commands.describe(word="Your 5-letter guess")
@@ -210,37 +194,34 @@ def _bind_commands(_tree: app_commands.CommandTree):
             return
         game = bounty_games.get(inter.guild.id)
         if not game:
-            return await send_boxed(inter, "Bounty", "No active bounty right now.", icon="🎯", ephemeral=True)
+            return await inter.response.send_message("No active bounty right now.", ephemeral=True)
         if inter.channel.id != game["channel_id"]:
             ch = inter.guild.get_channel(game["channel_id"])
-            where = ch.mention if isinstance(ch, discord.TextChannel) else "the bounty channel"
-            return await send_boxed(inter, "Bounty", f"Use this in {where}.", icon="🎯", ephemeral=True)
+            return await inter.response.send_message(f"Use this in {ch.mention if ch else 'the bounty channel'}.", ephemeral=True)
 
-        # per-user cooldown
+        # Per-user cooldown
         now_s = gmt_now_s()
         key = (inter.guild.id, inter.user.id)
         last = last_bounty_guess_ts.get(key, 0)
-        delta = now_s - last
-        if delta < BOUNTY_GUESS_COOLDOWN_S:
-            wait = int(BOUNTY_GUESS_COOLDOWN_S - delta)
-            return await send_boxed(inter, "Slow down", f"**{wait}s** cooldown between guesses.", icon="⏳", ephemeral=True)
+        if (now_s - last) < BOUNTY_GUESS_COOLDOWN_S:
+            wait = int(BOUNTY_GUESS_COOLDOWN_S - (now_s - last))
+            return await inter.response.send_message(f"Slow down — **{wait}s** cooldown between guesses.", ephemeral=True)
 
         cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
         if len(cleaned) != 5:
-            return await send_boxed(inter, "Invalid Guess", "Guess must be exactly **5 letters**.", icon="❗", ephemeral=True)
-        from ..core.utils import is_valid_guess, render_row, score_guess  # local import to avoid cycles
+            return await inter.response.send_message("Guess must be exactly 5 letters.", ephemeral=True)
         if not is_valid_guess(cleaned):
-            return await send_boxed(inter, "Invalid Guess", "That’s not in the Wordle dictionary (UK variants supported).", icon="📚", ephemeral=True)
+            return await inter.response.send_message("That’s not in the Wordle dictionary (UK variants supported).", ephemeral=True)
 
-        # start cooldown
+        # Start cooldown after accepting a valid guess
         last_bounty_guess_ts[key] = now_s
 
         colors = score_guess(cleaned, game["answer"])
         row = render_row(cleaned, colors)
 
-        # live feedback
         await inter.response.send_message(row)
 
+        # WIN
         if cleaned == game["answer"]:
             gid, uid = inter.guild.id, inter.user.id
             await change_balance(gid, uid, BOUNTY_PAYOUT, announce_channel_id=game["channel_id"])
@@ -252,70 +233,68 @@ def _bind_commands(_tree: app_commands.CommandTree):
             ans_up = ans_raw.upper()
             del bounty_games[gid]
 
-            # small confirmation in-channel
-            await safe_send(
-                inter.channel,
-                f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**! (Balance: {bal})",
-                allowed_mentions=discord.AllowedMentions(users=[inter.user])
+            await inter.followup.send(
+                f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**! (Balance: {bal})"
             )
 
-            # definition + neat card in announcements
-            from ..core.utils import fetch_definition  # same helper you used
-            definition = await fetch_definition(ans_raw)
-            fields = []
-            if definition:
-                fields.append(("Definition", definition, False))
-            fields.append(("Result", row, False))  # emojis render
+            # definition optional (uses dictionary API in your utils via fetch_definition in monolith).
+            # To avoid an extra dependency here, we just announce with result row.
+            fields = [("Result", row, False)]
 
             emb = make_card(
                 title="🎯 Hourly Bounty — Solved",
                 description=f"{inter.user.mention} wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}** by solving **{ans_up}**.",
                 fields=fields,
+                color=discord.Color.green(),
             )
-            await announce_result(inter.guild, origin_cid=None, content="", embed=emb)
+            # Post to announcements channel (helper will no-op if not configured)
+            await _announce_result(inter.guild, content="", embed=emb)
         else:
             await inter.followup.send("(Keep trying! Unlimited guesses.)")
 
 
-# -------------------- listeners --------------------
+# ---------------------------------------------------------------------
+# Listener hooks
+# ---------------------------------------------------------------------
 async def _on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     gid = payload.guild_id
-    if gid is None or (bot and bot.user and payload.user_id == bot.user.id):
+    if gid is None or not bot or (bot.user and payload.user_id == bot.user.id):
         return
 
     pend = pending_bounties.get(gid)
     if not pend or payload.message_id != pend.get("message_id") or not _bounty_emoji_matches(payload.emoji):
         return
 
-    guild = discord.utils.get(bot.guilds, id=gid) if bot else None
+    guild = discord.utils.get(bot.guilds, id=gid)
     if not guild:
         return
 
-    # Validate player
     try:
         member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
     except Exception:
         member = None
+
     if not member or member.bot or not await is_worldler(guild, member):
         return
 
-    # track
-    users: Set[int] = pend["users"]
-    users.add(member.id)
+    # add user to set
+    pend["users"].add(member.id)
 
-    # show roster on the card
+    # Build roster text
+    names = []
+    for uid in sorted(pend["users"]):
+        try:
+            m = guild.get_member(uid) or await guild.fetch_member(uid)
+            names.append(m.mention if m else f"<@{uid}>")
+        except Exception:
+            names.append(f"<@{uid}>")
+    players_txt = ", ".join(names) if names else "—"
+
+    # Edit gate embed showing roster
     try:
         ch = guild.get_channel(pend["channel_id"])
         if isinstance(ch, discord.TextChannel):
             msg = await ch.fetch_message(pend["message_id"])
-            names = []
-            for uid in sorted(users):
-                try:
-                    m = guild.get_member(uid) or await guild.fetch_member(uid)
-                    names.append(m.mention if m else f"<@{uid}>")
-                except Exception:
-                    names.append(f"<@{uid}>")
-            players_txt = ", ".join(names) if names else "—"
             desc = (
                 f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
                 f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
@@ -332,40 +311,32 @@ async def _on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     except Exception:
         pass
 
-    # start arming countdown if we just reached 2
-    if len(users) >= 2 and not pend.get("arming_at"):
+    # If we just reached 2 players, start arming countdown
+    if len(pend["users"]) >= 2 and not pend.get("arming_at"):
         pend["arming_at"] = gmt_now_s() + BOUNTY_ARM_DELAY_S
         try:
             ch = guild.get_channel(pend["channel_id"])
-            await send_boxed(ch, "Bounty", f"✅ Armed by **{len(users)}** players. **Arming in {BOUNTY_ARM_DELAY_S//60} minute…**", icon="🎯")
+            await send_boxed(ch, "Bounty", f"✅ Armed by {', '.join(names[:2])}. **Arming in {BOUNTY_ARM_DELAY_S//60} minute…**", icon="🎯")
         except Exception:
             pass
-
-    # tidy up: remove the user's reaction so others can easily click too
-    try:
-        ch = guild.get_channel(pend["channel_id"])
-        if isinstance(ch, discord.TextChannel):
-            msg = await ch.fetch_message(pend["message_id"])
-            await msg.remove_reaction(payload.emoji, member)  # type: ignore[name-defined]
-    except Exception:
-        pass
 
 
 async def _on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     gid = payload.guild_id
     if gid is None:
         return
-
     pend = pending_bounties.get(gid)
     if not pend or payload.message_id != pend.get("message_id") or not _bounty_emoji_matches(payload.emoji):
         return
 
-    # Remove from set
     uid = payload.user_id
-    if uid in pend.get("users", set()):
+    if uid and uid in pend.get("users", set()):
         pend["users"].discard(uid)
 
-    guild = discord.utils.get(bot.guilds, id=gid) if bot else None
+    if not bot:
+        return
+
+    guild = discord.utils.get(bot.guilds, id=gid)
     if not guild:
         return
 
@@ -378,7 +349,7 @@ async def _on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         except Exception:
             pass
 
-    # Edit roster on the card
+    # Refresh roster on gate embed
     try:
         ch = guild.get_channel(pend["channel_id"])
         if isinstance(ch, discord.TextChannel):
@@ -408,17 +379,18 @@ async def _on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         pass
 
 
-# -------------------- scheduler --------------------
+# ---------------------------------------------------------------------
+# Hourly loop
+# ---------------------------------------------------------------------
 @tasks.loop(seconds=20)
 async def bounty_loop():
     if not bot:
         return
-
     now = gmt_now_s()
     hour_idx = current_hour_index_gmt()
-    within_window = (now % 3600) < 40  # first ~40s of the hour
+    within_window = (now % 3600) < 40
 
-    # 1) Expire pending (not armed) prompts
+    # 1) Expire pending prompts
     for gid, pend in list(pending_bounties.items()):
         try:
             if now >= pend.get("expires_at", 0):
@@ -452,7 +424,7 @@ async def bounty_loop():
         except Exception:
             continue
 
-    # 1.5) Arm any prompts whose countdown reached zero
+    # 1.5) Arm any prompts whose countdown finished
     for gid, pend in list(pending_bounties.items()):
         try:
             arm_at = pend.get("arming_at")
@@ -508,56 +480,114 @@ async def bounty_loop():
             continue
 
     # 3) Drop a NEW bounty prompt this hour
-    if within_window:
-        for guild in list(bot.guilds):
-            try:
-                if guild.id in bounty_games or guild.id in pending_bounties:
-                    continue
-                cfg = await get_cfg(guild.id)
-                if cfg.get("last_bounty_hour", 0) == hour_idx:
-                    continue
-                ch = await _find_bounty_channel(guild)
-                if not ch:
-                    continue
-                await _post_bounty_prompt(guild, ch, hour_idx)
-            except Exception:
+    for guild in list(bot.guilds):
+        try:
+            if guild.id in bounty_games or guild.id in pending_bounties:
                 continue
+            cfg = await get_cfg(guild.id)
+            if cfg.get("last_bounty_hour", 0) == hour_idx:
+                continue
+            if not within_window:
+                continue
+            ch = await _find_bounty_channel(guild)
+            if not ch:
+                continue
+            await _post_bounty_prompt(guild, ch, hour_idx)
+        except Exception:
+            continue
 
 
 @bounty_loop.before_loop
 async def _before_bounty_loop():
-    # wait for client
     if bot:
         await bot.wait_until_ready()
 
 
-# -------------------- registration --------------------
+# ---------------------------------------------------------------------
+# Announce helper (re-uses your announcement channel logic)
+# ---------------------------------------------------------------------
+async def _announce_result(guild: discord.Guild, content: str = "", embed: Optional[discord.Embed] = None):
+    """Post to configured announcements channel (no-op if unset)."""
+    if not guild:
+        return
+    try:
+        cfg = await get_cfg(guild.id)
+        ann_id = cfg.get("announcements_channel_id")
+        if not ann_id:
+            return
+        ch = guild.get_channel(ann_id)
+        if not isinstance(ch, discord.TextChannel):
+            return
+        await safe_send(ch, content=content or None, embed=embed)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------
+# Public router (for text shortcuts)
+# ---------------------------------------------------------------------
+async def maybe_route_guess(message: discord.Message, word: str) -> bool:
+    """If this channel is the active bounty channel, route the guess like `/worldle_bounty_guess`."""
+    game = bounty_games.get(getattr(message.guild, "id", 0))
+    if not game or message.channel.id != game["channel_id"]:
+        return False
+
+    # Emulate the slash handler quickly (without ephemerals)
+    now_s = gmt_now_s()
+    key = (message.guild.id, message.author.id)
+    last = last_bounty_guess_ts.get(key, 0)
+    if (now_s - last) < BOUNTY_GUESS_COOLDOWN_S:
+        wait = int(BOUNTY_GUESS_COOLDOWN_S - (now_s - last))
+        await safe_send(message.channel, f"{message.author.mention} slow down — **{wait}s** cooldown.",)
+        return True
+
+    cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
+    if len(cleaned) != 5 or not is_valid_guess(cleaned):
+        await safe_send(message.channel, f"{message.author.mention} guess must be exactly 5 letters (valid Wordle word).")
+        return True
+
+    last_bounty_guess_ts[key] = now_s
+
+    colors = score_guess(cleaned, game["answer"])
+    row = render_row(cleaned, colors)
+    await safe_send(message.channel, row)
+
+    if cleaned == game["answer"]:
+        gid, uid = message.guild.id, message.author.id
+        await change_balance(gid, uid, BOUNTY_PAYOUT, announce_channel_id=game["channel_id"])
+        await inc_stat(gid, uid, "bounties_won", 1)
+        bal = await get_balance(gid, uid)
+        ans_up = game["answer"].upper()
+        bounty_games.pop(gid, None)
+
+        await safe_send(
+            message.channel,
+            f"🏆 {message.author.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**! (Balance: {bal})"
+        )
+
+        emb = make_card(
+            title="🎯 Hourly Bounty — Solved",
+            description=f"{message.author.mention} wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}** by solving **{ans_up}**.",
+            fields=[("Result", row, False)],
+            color=discord.Color.green(),
+        )
+        await _announce_result(message.guild, content="", embed=emb)
+    return True
+
+
+# ---------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------
 def register(_bot: commands.Bot, _tree: app_commands.CommandTree) -> None:
-    """Wire commands, listeners, and start the hourly loop."""
     global bot, tree
     bot, tree = _bot, _tree
 
-    # commands
     _bind_commands(_tree)
 
-    # listeners (attach once)
-    if not hasattr(bot, "_ww_bounty_listeners"):
-        async def _add(payload: discord.RawReactionActionEvent):
-            try:
-                await _on_raw_reaction_add(payload)
-            except Exception:
-                pass
+    # listeners
+    bot.add_listener(_on_raw_reaction_add, "on_raw_reaction_add")
+    bot.add_listener(_on_raw_reaction_remove, "on_raw_reaction_remove")
 
-        async def _remove(payload: discord.RawReactionActionEvent):
-            try:
-                await _on_raw_reaction_remove(payload)
-            except Exception:
-                pass
-
-        bot.add_listener(_add, name="on_raw_reaction_add")
-        bot.add_listener(_remove, name="on_raw_reaction_remove")
-        bot._ww_bounty_listeners = True  # type: ignore[attr-defined]
-
-    # start loop
+    # start loop once
     if not bounty_loop.is_running():
         bounty_loop.start()
