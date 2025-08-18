@@ -1,65 +1,46 @@
 # worldle_bot/features/dailies.py
 """
-Daily actions (/dailies command, reactions, and panel embed).
+Daily actions feature.
+- /dailies command
+- Reaction handlers for pray, beg, solo, word pot
 """
 
-import logging
 import discord
 from discord import app_commands
+from discord.ext import commands
 
-from ..core.utils import safe_send, make_panel
-from ..core.db import get_balance, change_balance, get_stones, change_stones
-from ..core.config import EMO_SHEKEL, EMO_STONE
-from .roles import is_worldler
-from .casino import casino_start_word_pot
-from .solo import solo_start
+from ..core.utils import safe_send
+from ..core.db import (
+    get_balance, change_balance, change_stones, get_stones,
+    _get_cd, _set_cd, get_word_pot_total
+)
+from ..features.roles import is_worldler
+from ..features.casino import casino_start_word_pot
+from ..features.solo import solo_start, solo_guess
+from ..core.config import EMO_SHEKEL, EMO_STONE, uk_today_str
 
-log = logging.getLogger("worldle_bot")
+bot: commands.Bot
+tree: app_commands.CommandTree
+log = None  # injected in main.py
 
-# Track active dailies panels
+# Track dailies messages for reaction listening
 dailies_msg_ids: set[int] = set()
 
 
 # -------------------------------------------------------------------
-# Cooldowns
-# -------------------------------------------------------------------
-async def _get_cd(gid: int, uid: int) -> tuple[str | None, str | None]:
-    """
-    Stub for cooldown lookup.
-    TODO: wire into your DB schema.
-    Returns (last_pray_date, last_beg_date).
-    """
-    return None, None
-
-
-async def _set_cd(gid: int, uid: int, field: str, value: str):
-    """
-    Stub for cooldown setting.
-    TODO: wire into your DB schema.
-    """
-    return
-
-
-def uk_today_str() -> str:
-    """Return today's date string in UK timezone (YYYY-MM-DD)."""
-    from datetime import datetime, timezone, timedelta
-    uk = timezone(timedelta(hours=0))
-    return datetime.now(uk).strftime("%Y-%m-%d")
-
-
-# -------------------------------------------------------------------
-# Reaction listeners
+# Reaction Handlers
 # -------------------------------------------------------------------
 async def dailies_reaction_listener(payload: discord.RawReactionActionEvent):
     """Independent reaction handler for /dailies panels only."""
     try:
+        if payload.user_id == (bot.user.id if bot.user else 0):
+            return
         if payload.message_id not in dailies_msg_ids:
             return
 
-        guild = discord.utils.get(payload.guild_id and payload.cached_message.guilds or [])
+        guild = discord.utils.get(bot.guilds, id=payload.guild_id)
         if not guild:
             return
-
         try:
             member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
         except Exception:
@@ -67,7 +48,7 @@ async def dailies_reaction_listener(payload: discord.RawReactionActionEvent):
         if not member or member.bot or not await is_worldler(guild, member):
             return
 
-        channel = guild.get_channel(payload.channel_id)
+        channel = guild.get_channel(payload.channel_id) if hasattr(payload, "channel_id") else None
         if not isinstance(channel, discord.TextChannel):
             try:
                 channel = await guild.fetch_channel(payload.channel_id)
@@ -76,45 +57,57 @@ async def dailies_reaction_listener(payload: discord.RawReactionActionEvent):
 
         emoji_name = payload.emoji.name
 
+        # 🧩 Start Solo
         if emoji_name == "🧩":
-            # Start Solo
             ch = await solo_start(channel, member)
             if isinstance(ch, discord.TextChannel):
-                await safe_send(channel, f"🧩 {member.mention} your solo room is {ch.mention}.")
+                await safe_send(
+                    channel,
+                    f"🧩 {member.mention} your solo room is {ch.mention}.",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+                )
 
+        # 🛐 Pray
         elif emoji_name == "🛐":
-            # Pray
             gid, uid = guild.id, member.id
             today = uk_today_str()
             last_pray, _ = await _get_cd(gid, uid)
             if last_pray == today:
-                await safe_send(channel, f"🛐 {member.mention} you already prayed today.")
+                await safe_send(channel, f"🛐 {member.mention} you already prayed today.", 
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
             else:
                 await change_balance(gid, uid, 5, announce_channel_id=channel.id)
                 await _set_cd(gid, uid, "last_pray", today)
                 bal = await get_balance(gid, uid)
-                await safe_send(channel, f"🛐 {member.mention} +5 {EMO_SHEKEL()} — Balance **{bal}**")
+                await safe_send(channel, f"🛐 {member.mention} +5 {EMO_SHEKEL()} — Balance **{bal}**",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
+        # 🙇 Beg
         elif emoji_name == "🙇":
-            # Beg
             gid, uid = guild.id, member.id
             today = uk_today_str()
             _, last_beg = await _get_cd(gid, uid)
             if last_beg == today:
-                await safe_send(channel, f"🙇 {member.mention} you already begged today.")
+                await safe_send(channel, f"🙇 {member.mention} you already begged today.",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
             else:
                 await change_stones(gid, uid, 5)
                 await _set_cd(gid, uid, "last_beg", today)
                 stones = await get_stones(gid, uid)
-                await safe_send(channel, f"🙇 {member.mention} {EMO_STONE()} +5 Stones — You now have **{stones}**.")
+                await safe_send(channel, f"🙇 {member.mention} {EMO_STONE()} +5 Stones — You now have **{stones}**.",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
+        # 🎰 Word Pot
         elif emoji_name == "🎰":
-            # Word Pot (casino)
             ch = await casino_start_word_pot(channel, member)
             if isinstance(ch, discord.TextChannel):
-                await safe_send(channel, f"🎰 {member.mention} Word Pot room: {ch.mention}")
+                await safe_send(
+                    channel,
+                    f"🎰 {member.mention} Word Pot room: {ch.mention}",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+                )
 
-        # Remove user’s reaction for reusability
+        # Tidy up: remove the user’s reaction
         try:
             msg = await channel.fetch_message(payload.message_id)
             await msg.remove_reaction(payload.emoji, member)
@@ -125,45 +118,101 @@ async def dailies_reaction_listener(payload: discord.RawReactionActionEvent):
         log.warning(f"[dailies] reaction handler error: {e}")
 
 
+async def dailies_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Reaction handler for /dailies panels (with refresh)."""
+    try:
+        if payload.message_id not in dailies_msg_ids:
+            return
+        if bot.user and payload.user_id == bot.user.id:
+            return
+
+        guild = discord.utils.get(bot.guilds, id=payload.guild_id)
+        if not guild:
+            return
+        try:
+            member = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+        except Exception:
+            member = None
+        if not member or member.bot or not await is_worldler(guild, member):
+            return
+
+        channel = guild.get_channel(getattr(payload, "channel_id", 0))
+        if not isinstance(channel, discord.TextChannel):
+            try:
+                channel = await guild.fetch_channel(getattr(payload, "channel_id", 0))
+            except Exception:
+                return
+
+        emoji_name = payload.emoji.name
+
+        if emoji_name == "🧩":
+            ch = await solo_start(channel, member)
+            if isinstance(ch, discord.TextChannel):
+                await safe_send(channel, f"🧩 {member.mention} your solo room is {ch.mention}.",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
+        elif emoji_name == "🛐":
+            gid, uid = guild.id, member.id
+            today = uk_today_str()
+            last_pray, _ = await _get_cd(gid, uid)
+            if last_pray == today:
+                await safe_send(channel, f"🛐 {member.mention} you already prayed today (resets 00:00 UK).",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+            else:
+                await change_balance(gid, uid, 5, announce_channel_id=channel.id)
+                await _set_cd(gid, uid, "last_pray", today)
+                bal = await get_balance(gid, uid)
+                await safe_send(channel, f"🛐 {member.mention} +5 {EMO_SHEKEL()} — Balance **{bal}**",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
+        elif emoji_name == "🙇":
+            gid, uid = guild.id, member.id
+            today = uk_today_str()
+            _, last_beg = await _get_cd(gid, uid)
+            if last_beg == today:
+                await safe_send(channel, f"🙇 {member.mention} you already begged today (resets 00:00 UK).",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+            else:
+                await change_stones(gid, uid, 5)
+                await _set_cd(gid, uid, "last_beg", today)
+                stones = await get_stones(gid, uid)
+                await safe_send(channel, f"🙇 {member.mention} {EMO_STONE()} +5 Stones — You now have **{stones}**.",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
+        elif emoji_name == "🎰":
+            ch = await casino_start_word_pot(channel, member)
+            if isinstance(ch, discord.TextChannel):
+                await safe_send(channel, f"🎰 {member.mention} Word Pot room: {ch.mention}",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+
+        # Remove reaction
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+            await msg.remove_reaction(payload.emoji, member)
+        except Exception:
+            pass
+
+        # 🔄 Refresh panel
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+            new_emb = await _build_dailies_embed(guild.id, member.id)
+            await msg.edit(embed=new_emb)
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.warning(f"[dailies] reaction handler error: {e}")
+
+
 # -------------------------------------------------------------------
-# Slash command
+# Slash Command
 # -------------------------------------------------------------------
-class DailiesView(discord.ui.View):
-    """Buttons for /dailies panel."""
-
-    def __init__(self, interaction: discord.Interaction, pot_amount: int = 0):
-        super().__init__(timeout=None)
-        self.interaction = interaction
-        self.pot_amount = pot_amount
-        self.message = None
-
-    def attach_message(self, msg: discord.Message):
-        self.message = msg
-
-
-async def _build_dailies_embed(gid: int, uid: int) -> discord.Embed:
-    """Build the daily actions embed."""
-    bal = await get_balance(gid, uid)
-    stones = await get_stones(gid, uid)
-    emb = make_panel(
-        title="Daily Actions",
-        description=(
-            f"🛐 Pray (+5 {EMO_SHEKEL()})\n"
-            f"🙇 Beg (+5 {EMO_STONE()})\n"
-            f"🧩 Start Solo Room\n"
-            f"🎰 Word Pot Casino\n\n"
-            f"**Balance:** {bal} {EMO_SHEKEL()} | **Stones:** {stones} {EMO_STONE()}"
-        ),
-        icon="📅",
-    )
-    return emb
-
-
-@app_commands.command(name="dailies", description="Show your daily actions.")
+@tree.command(name="dailies", description="Show your daily actions.")
 async def dailies(interaction: discord.Interaction):
     emb = await _build_dailies_embed(interaction.guild.id, interaction.user.id)
+    pot_amount = await get_word_pot_total(interaction.guild.id)
 
-    view = DailiesView(interaction)
+    view = DailiesView(interaction, pot_amount=pot_amount)
     await interaction.response.send_message(embed=emb, view=view)
 
     try:
