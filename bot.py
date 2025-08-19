@@ -460,7 +460,7 @@ async def db_init():
     await add_column_if_missing(bot.db, "inv", "dungeon_tickets_t3", "INTEGER DEFAULT 0")
     await add_column_if_missing(bot.db, "guild_cfg", "suppress_bounty_ping", "INTEGER DEFAULT 0")
     await add_column_if_missing(bot.db, "guild_cfg", "drops_channel_id", "INTEGER")
-
+    await add_column_if_missing(bot.db, "guild_cfg", "next_bounty_bonus", "INTEGER DEFAULT 0")
 
 
 
@@ -1067,7 +1067,7 @@ async def get_cfg(gid: int):
     async with bot.db.execute(
         "SELECT bounty_channel_id, worldler_role_id, bounty_role_id, last_bounty_ts, "
         "solo_category_id, announcements_channel_id, last_bounty_hour, suppress_bounty_ping, "
-        "drops_channel_id FROM guild_cfg WHERE guild_id=?",
+        "drops_channel_id, next_bounty_bonus FROM guild_cfg WHERE guild_id=?",
         (gid,)
     ) as cur:
         row = await cur.fetchone()
@@ -1077,11 +1077,13 @@ async def get_cfg(gid: int):
             "last_bounty_ts": row[3] or 0, "solo_category_id": row[4],
             "announcements_channel_id": row[5], "last_bounty_hour": row[6] or 0,
             "suppress_bounty_ping": row[7] or 0, "drops_channel_id": row[8],
+            "next_bounty_bonus": row[9] or 0,
         }
     return {
         "bounty_channel_id": None, "worldler_role_id": None, "bounty_role_id": None,
         "last_bounty_ts": 0, "solo_category_id": None, "announcements_channel_id": None,
         "last_bounty_hour": 0, "suppress_bounty_ping": 0, "drops_channel_id": None,
+        "next_bounty_bonus": 0,
     }
 
 async def set_cfg(gid: int, **kwargs):
@@ -1090,9 +1092,9 @@ async def set_cfg(gid: int, **kwargs):
       INSERT INTO guild_cfg(
         guild_id, bounty_channel_id, worldler_role_id, bounty_role_id, last_bounty_ts,
         solo_category_id, announcements_channel_id, last_bounty_hour, suppress_bounty_ping,
-        drops_channel_id
+        drops_channel_id, next_bounty_bonus
       )
-      VALUES(?,?,?,?,?,?,?,?,?,?)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(guild_id) DO UPDATE SET
         bounty_channel_id=excluded.bounty_channel_id,
         worldler_role_id=excluded.worldler_role_id,
@@ -1102,11 +1104,13 @@ async def set_cfg(gid: int, **kwargs):
         announcements_channel_id=excluded.announcements_channel_id,
         last_bounty_hour=excluded.last_bounty_hour,
         suppress_bounty_ping=excluded.suppress_bounty_ping,
-        drops_channel_id=excluded.drops_channel_id
+        drops_channel_id=excluded.drops_channel_id,
+        next_bounty_bonus=excluded.next_bounty_bonus
     """, (
         gid, cfg["bounty_channel_id"], cfg["worldler_role_id"], cfg["bounty_role_id"],
         cfg["last_bounty_ts"], cfg["solo_category_id"], cfg["announcements_channel_id"],
         cfg["last_bounty_hour"], cfg["suppress_bounty_ping"], cfg["drops_channel_id"],
+        cfg["next_bounty_bonus"],
     ))
     await bot.db.commit()
 
@@ -2536,7 +2540,7 @@ def build_help_pages(guild_name: str | None = None) -> list[discord.Embed]:
     emb.add_field(name="Admin Setup", value="• **/worldle_bounty_setchannel** to choose the channel.", inline=False)
     emb.add_field(name="Manual Drop", value="• **/worldle_bounty_now** posts a prompt immediately.", inline=False)
     emb.add_field(name="Play", value="• **`bg WORD`** or **/worldle_bounty_guess word:WORD**", inline=False)
-    emb.add_field(name="Reward", value=f"• First solver wins **{BOUNTY_PAYOUT} {shek}**.", inline=False)
+    emb.add_field(name="Reward", value=f"• First solver wins **{BOUNTY_PAYOUT} {shek}** (+1 for each expired bounty).", inline=False)
     pages.append(emb)
 
     # 6) Duels
@@ -3101,11 +3105,13 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
     rid = await ensure_bounty_role(guild)
     em = EMO_BOUNTY()
     role_mention = "" if suppress_ping else (f"<@&{rid}>" if rid else "")
+    bonus = int(cfg.get("next_bounty_bonus", 0))
+    prize = BOUNTY_PAYOUT + bonus
 
     desc = (
       f"React with {em} to **arm** this bounty — need **2** players.\n"
       f"**After 2 react, the bounty arms in {BOUNTY_ARM_DELAY_S//60} minute.**\n"
-      f"**Prize:** {BOUNTY_PAYOUT} {EMO_SHEKEL()}\n"
+      f"**Prize:** {prize} {EMO_SHEKEL()}\n"
       "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
       f"⏲️ *This prompt expires in {BOUNTY_EXPIRE_MIN} minutes.*"
   )
@@ -3145,19 +3151,23 @@ async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int):
     if guild.id in bounty_games:
         return
     answer = random.choice(ANSWERS)
+    cfg = await get_cfg(guild.id)
+    bonus = int(cfg.get("next_bounty_bonus", 0))
+    payout = BOUNTY_PAYOUT + bonus
     bounty_games[guild.id] = {
         "answer": answer,
         "channel_id": channel_id,
         "started_at": gmt_now_s(),
         "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
+        "payout": payout,
     }
-    await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0)  # re-enable pings
+    await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0, next_bounty_bonus=0)
     ch = guild.get_channel(channel_id)
     if isinstance(ch, discord.TextChannel):
         emb = make_panel(
             title="🎯 Bounty armed!",
             description=(
-                f"First to solve in **{BOUNTY_EXPIRE_MIN} minutes** wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**.\n"
+                f"First to solve in **{BOUNTY_EXPIRE_MIN} minutes** wins **{payout} {EMO_SHEKEL()}**.\n"
                 "Use `bg WORD` or `/worldle_bounty_guess`."
             ),
         )
@@ -3232,7 +3242,8 @@ async def worldle_bounty_guess(inter: discord.Interaction, word: str):
 
     if cleaned == game["answer"]:
         gid, uid = inter.guild.id, inter.user.id
-        await change_balance(gid, uid, BOUNTY_PAYOUT, announce_channel_id=game["channel_id"])
+        payout = game.get("payout", BOUNTY_PAYOUT)
+        await change_balance(gid, uid, payout, announce_channel_id=game["channel_id"])
         await inc_stat(gid, uid, "bounties_won", 1)
         bal = await get_balance(gid, uid)
 
@@ -3243,7 +3254,7 @@ async def worldle_bounty_guess(inter: discord.Interaction, word: str):
 
         # small confirmation in-channel
         await inter.followup.send(
-            f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**! (Balance: {bal})"
+            f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{payout} {EMO_SHEKEL()}**! (Balance: {bal})"
         )
 
         # definition + neat card in announcements
@@ -3255,7 +3266,7 @@ async def worldle_bounty_guess(inter: discord.Interaction, word: str):
 
         emb = make_card(
             title="🎯 Hourly Bounty — Solved",
-            description=f"{inter.user.mention} wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}** by solving **{ans_up}**.",
+            description=f"{inter.user.mention} wins **{payout} {EMO_SHEKEL()}** by solving **{ans_up}**.",
             fields=fields,
             color=CARD_COLOR_SUCCESS,
         )
@@ -3290,15 +3301,15 @@ async def bounty_loop():
                 except Exception:
                     pass
 
-                # +1 to Word Pot
-                pot = await get_casino_pot(gid)
-                new_pot = pot + 1
-                await set_casino_pot(gid, new_pot)
+                # +1 to next bounty
+                cfg = await get_cfg(guild.id)
+                bonus = int(cfg.get("next_bounty_bonus", 0)) + 1
+                await set_cfg(guild.id, next_bounty_bonus=bonus)
 
                 if isinstance(ch, discord.TextChannel):
                     emb = make_panel(
                         title="⏲️ Bounty prompt expired",
-                        description=f"+1 {EMO_SHEKEL()} to **Word Pot** (now **{new_pot}**).",
+                        description=f"+1 {EMO_SHEKEL()} to next bounty (now **{BOUNTY_PAYOUT + bonus}**).",
                     )
                     try:
                         msg = await ch.fetch_message(pend["message_id"])
@@ -3346,17 +3357,17 @@ async def bounty_loop():
                 except Exception:
                     pass
 
-                # +1 to Word Pot
-                pot = await get_casino_pot(gid)
-                new_pot = pot + 1
-                await set_casino_pot(gid, new_pot)
+                # +1 to next bounty
+                cfg = await get_cfg(guild.id)
+                bonus = int(cfg.get("next_bounty_bonus", 0)) + 1
+                await set_cfg(guild.id, next_bounty_bonus=bonus)
 
                 if isinstance(ch, discord.TextChannel):
                     emb = make_panel(
                         title="⏲️ Bounty expired",
                         description=(
                             f"No solve in **{BOUNTY_EXPIRE_MIN} minutes**.\n"
-                            f"+1 {EMO_SHEKEL()} to **Word Pot** (now **{new_pot}**)."
+                            f"+1 {EMO_SHEKEL()} to next bounty (now **{BOUNTY_PAYOUT + bonus}**)."
                         ),
                     )
                     await safe_send(ch, embed=emb)
@@ -3431,10 +3442,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 ch = guild.get_channel(pend["channel_id"])
                 if isinstance(ch, discord.TextChannel):
                     msg = await ch.fetch_message(pend["message_id"])
+                    cfg = await get_cfg(guild.id)
+                    bonus = int(cfg.get("next_bounty_bonus", 0))
+                    prize = BOUNTY_PAYOUT + bonus
                     desc = (
                         f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
                         f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
-                        f"**Prize:** {BOUNTY_PAYOUT} {EMO_SHEKEL()}\n"
+                        f"**Prize:** {prize} {EMO_SHEKEL()}\n"
                         "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
                         f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
                     )
@@ -3632,10 +3646,13 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
                     except Exception:
                         names.append(f"<@{id_}>")
                 players_txt = ", ".join(names) if names else "—"
+                cfg = await get_cfg(guild.id)
+                bonus = int(cfg.get("next_bounty_bonus", 0))
+                prize = BOUNTY_PAYOUT + bonus
                 desc = (
                     f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
                     f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
-                    f"**Prize:** {BOUNTY_PAYOUT} {EMO_SHEKEL()}\n"
+                    f"**Prize:** {prize} {EMO_SHEKEL()}\n"
                     "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
                     f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
                 )
