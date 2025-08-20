@@ -12,6 +12,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 import aiosqlite
 
+
 # -------------------- basic setup --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("wordle")
@@ -1557,8 +1558,8 @@ async def ensure_default_tiers(guild: discord.Guild):
 
 # -------------------- state --------------------
 solo_games: dict[Tuple[int,int,int], dict] = {}     # (gid, cid, uid) -> {answer, guesses[], max, legend, origin_cid}
-bounty_games: dict[int, dict] = {}                  # gid -> {answer, channel_id, started_at}
-pending_bounties: dict[int, dict] = {}              # gid -> {message_id, channel_id, users:set, hour_idx}
+bounty_games: dict[int, dict] = {}                  # gid -> {answer, channel_id, started_at, mode?, participants?, payout}
+pending_bounties: dict[int, dict] = {}              # gid -> {message_id, channel_id, users:set, hour_idx, mode?, payout, arming_at?}
 duels: dict[int, dict] = {}                         # duel_id -> data
 _next_duel_id = 1
 solo_channels: dict[Tuple[int,int], int] = {}       # (gid, uid) -> channel_id
@@ -2675,6 +2676,11 @@ BOUNTY_EXPIRE_S = BOUNTY_EXPIRE_MIN * 60
 BOUNTY_ARM_DELAY_S = 60          # wait 60s after 2 reactions before arming
 BOUNTY_GUESS_COOLDOWN_S = 5      # 5s per-user cooldown between guesses
 
+# Worldle Royale constants
+ROYALE_MIN_PLAYERS = 4
+ROYALE_ARM_DELAY_S = 300  # 10 minutes
+
+
 # Track last guess time per (guild_id, user_id) for the bounty
 last_bounty_guess_ts: dict[tuple[int, int], int] = {}
 
@@ -3153,6 +3159,14 @@ def _bounty_emoji_matches(emoji: discord.PartialEmoji) -> bool:
     if emoji.is_unicode_emoji():
         return emoji.name == "🎯"
     return (emoji.name or "").lower() == target_name
+  
+
+def _pend_requirements(pend: dict) -> tuple[int, int]:
+    """Return (needed_players, arm_delay_s) for pending bounty or royale."""
+    if pend.get("mode") == "royale":
+        return ROYALE_MIN_PLAYERS, ROYALE_ARM_DELAY_S
+    return 2, BOUNTY_ARM_DELAY_S
+  
 
 async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel, hour_idx: int):
     if guild.id in pending_bounties or guild.id in bounty_games:
@@ -3166,16 +3180,27 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
     role_mention = "" if suppress_ping else (f"<@&{rid}>" if rid else "")
     bonus = int(cfg.get("next_bounty_bonus", 0))
     prize = BOUNTY_PAYOUT + bonus
+    mode = "royale" if prize >= 20 else "bounty"
 
-    desc = (
-      f"React with {em} to **arm** this bounty — need **2** players.\n"
-      f"**After 2 react, the bounty arms in {BOUNTY_ARM_DELAY_S//60} minute.**\n"
-      f"**Prize:** {prize} {EMO_SHEKEL()}\n"
-      "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
-      f"⏲️ *This prompt expires in {BOUNTY_EXPIRE_MIN} minutes.*"
-  )
+    if mode == "royale":
+        desc = (
+            f"React with {em} to **join Worldle Royale** — need **{ROYALE_MIN_PLAYERS}** players.\n"
+            f"After {ROYALE_MIN_PLAYERS} react, the royale **starts in {ROYALE_ARM_DELAY_S//60} minutes**.\n"
+            f"**Prize pool:** {prize} {EMO_SHEKEL()}\n"
+            "Use `bg APPLE` or `/worldle_bounty_guess` when started.\n\n"
+            f"⏲️ *This prompt expires in {BOUNTY_EXPIRE_MIN} minutes.*"
+        )
+    else:
+        desc = (
+            f"React with {em} to **arm** this bounty — need **2** players.\n"
+            f"**After 2 react, the bounty arms in {BOUNTY_ARM_DELAY_S//60} minute.**\n"
+            f"**Prize:** {prize} {EMO_SHEKEL()}\n"
+            "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+            f"⏲️ *This prompt expires in {BOUNTY_EXPIRE_MIN} minutes.*"
+        )
 
-    emb = make_panel(title=f"{em} Hourly Bounty (GMT)", description=desc)
+    title = f"{em} Hourly Bounty (GMT)" if mode != "royale" else "👑 Worldle Royale"
+    emb = make_panel(title=title, description=desc)
 
     # Use content for the role ping so it actually notifies
     msg = await safe_send(
@@ -3197,6 +3222,8 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
         "users": set(),
         "hour_idx": hour_idx,
         "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
+        "mode": mode,
+        "payout": prize,
     }
     await set_cfg(guild.id, last_bounty_hour=hour_idx)
     return True
@@ -3206,31 +3233,54 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
 
 
 
-async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int):
+async def _start_bounty_after_gate(guild: discord.Guild, pend: dict):
+    pending_bounties.pop(guild.id, None)
     if guild.id in bounty_games:
         return
-    answer = random.choice(ANSWERS)
-    cfg = await get_cfg(guild.id)
-    bonus = int(cfg.get("next_bounty_bonus", 0))
-    payout = BOUNTY_PAYOUT + bonus
-    bounty_games[guild.id] = {
-        "answer": answer,
-        "channel_id": channel_id,
-        "started_at": gmt_now_s(),
-        "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
-        "payout": payout,
-    }
-    await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0, next_bounty_bonus=0)
-    ch = guild.get_channel(channel_id)
-    if isinstance(ch, discord.TextChannel):
-        emb = make_panel(
-            title="🎯 Bounty armed!",
-            description=(
-                f"First to solve in **{BOUNTY_EXPIRE_MIN} minutes** wins **{payout} {EMO_SHEKEL()}**.\n"
-                "Use `bg WORD` or `/worldle_bounty_guess`."
-            ),
-        )
-        await safe_send(ch, embed=emb)
+    channel_id = pend["channel_id"]
+    mode = pend.get("mode", "bounty")
+    payout = pend.get("payout", BOUNTY_PAYOUT)
+    if mode == "royale":
+        bounty_games[guild.id] = {
+            "mode": "royale",
+            "answer": random.choice(ANSWERS),
+            "channel_id": channel_id,
+            "started_at": gmt_now_s(),
+            "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
+            "participants": set(pend.get("users", set())),
+            "payout": payout,
+            "next_increase_at": gmt_now_s() + 59 * 60,
+        }
+        await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0, next_bounty_bonus=0)
+        ch = guild.get_channel(channel_id)
+        if isinstance(ch, discord.TextChannel):
+            emb = make_panel(
+                title="👑 Worldle Royale!",
+                description=(
+                    f"{len(pend.get('users', set()))} players entered. Solve to be safe; one random player will be eliminated each round.\n"
+                    f"Last standing wins **{payout} {EMO_SHEKEL()}**."
+                ),
+            )
+            await safe_send(ch, embed=emb)
+    else:
+        bounty_games[guild.id] = {
+            "answer": random.choice(ANSWERS),
+            "channel_id": channel_id,
+            "started_at": gmt_now_s(),
+            "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
+            "payout": payout,
+        }
+        await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0, next_bounty_bonus=0)
+        ch = guild.get_channel(channel_id)
+        if isinstance(ch, discord.TextChannel):
+            emb = make_panel(
+                title="🎯 Bounty armed!",
+                description=(
+                    f"First to solve in **{BOUNTY_EXPIRE_MIN} minutes** wins **{payout} {EMO_SHEKEL()}**.\n"
+                    "Use `bg WORD` or `/worldle_bounty_guess`."
+                ),
+            )
+            await safe_send(ch, embed=emb)
 
 
 
@@ -3273,6 +3323,11 @@ async def worldle_bounty_guess(inter: discord.Interaction, word: str):
         ch = inter.guild.get_channel(game["channel_id"])
         return await inter.response.send_message(f"Use this in {ch.mention if ch else 'the bounty channel'}.", ephemeral=True)
 
+    mode = game.get("mode", "bounty")
+    if mode == "royale" and inter.user.id not in game.get("participants", set()):
+        return await inter.response.send_message("You're not part of this Worldle Royale.", ephemeral=True)
+      
+
     # NEW: per-user cooldown
     now_s = gmt_now_s()
     key = (inter.guild.id, inter.user.id)
@@ -3301,35 +3356,71 @@ async def worldle_bounty_guess(inter: discord.Interaction, word: str):
 
     if cleaned == game["answer"]:
         gid, uid = inter.guild.id, inter.user.id
-        payout = game.get("payout", BOUNTY_PAYOUT)
-        await change_balance(gid, uid, payout, announce_channel_id=game["channel_id"])
-        await inc_stat(gid, uid, "bounties_won", 1)
-        bal = await get_balance(gid, uid)
-
-        # capture & clear
-        ans_raw = game["answer"]
-        ans_up = ans_raw.upper()
-        del bounty_games[gid]
-
-        # small confirmation in-channel
-        await inter.followup.send(
-            f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{payout} {EMO_SHEKEL()}**! (Balance: {bal})"
-        )
-
-        # definition + neat card in announcements
-        definition = await fetch_definition(ans_raw)
-        fields = []
-        if definition:
-            fields.append(("Definition", definition, False))
-        fields.append(("Result", row, False))  # emojis render
-
-        emb = make_card(
-            title="🎯 Hourly Bounty — Solved",
-            description=f"{inter.user.mention} wins **{payout} {EMO_SHEKEL()}** by solving **{ans_up}**.",
-            fields=fields,
-            color=CARD_COLOR_SUCCESS,
-        )
-        await _announce_result(inter.guild, origin_cid=None, content="", embed=emb)
+        if mode == "royale":
+            participants = game.get("participants", set())
+            solver = uid
+            others = [p for p in participants if p != solver]
+            eliminated = random.choice(others) if others else None
+            if eliminated:
+                participants.discard(eliminated)
+            elim_txt = f" ❌ <@{eliminated}> eliminated." if eliminated else ""
+            await inter.followup.send(f"✅ {inter.user.mention} is safe!{elim_txt}")
+            if len(participants) <= 1:
+                winner_id = next(iter(participants))
+                payout = game.get("payout", BOUNTY_PAYOUT)
+                await change_balance(gid, winner_id, payout, announce_channel_id=game["channel_id"])
+                await inc_stat(gid, winner_id, "bounties_won", 1)
+                bal = await get_balance(gid, winner_id)
+                ans_raw = game["answer"]
+                ans_up = ans_raw.upper()
+                del bounty_games[gid]
+                pending_bounties.pop(gid, None)
+                winner_member = inter.guild.get_member(winner_id)
+                winner_mention = winner_member.mention if winner_member else f"<@{winner_id}>"
+                await inter.followup.send(
+                    f"🏆 {winner_mention} wins Worldle Royale and earns **{payout} {EMO_SHEKEL()}**! (Balance: {bal})"
+                )
+                definition = await fetch_definition(ans_raw)
+                fields = []
+                if definition:
+                    fields.append(("Definition", definition, False))
+                fields.append(("Result", row, False))
+                emb = make_card(
+                    title="👑 Worldle Royale — Winner",
+                    description=f"{winner_mention} survives and wins **{payout} {EMO_SHEKEL()}** by solving **{ans_up}**.",
+                    fields=fields,
+                    color=CARD_COLOR_SUCCESS,
+                )
+                await _announce_result(inter.guild, origin_cid=None, content="", embed=emb)
+                await set_cfg(inter.guild.id, next_bounty_bonus=0)
+            else:
+                game["answer"] = random.choice(ANSWERS)
+                game["started_at"] = gmt_now_s()
+                game["expires_at"] = gmt_now_s() + BOUNTY_EXPIRE_S
+                await inter.followup.send(f"Next word! {len(participants)} players remain.")
+        else:
+            payout = game.get("payout", BOUNTY_PAYOUT)
+            await change_balance(gid, uid, payout, announce_channel_id=game["channel_id"])
+            await inc_stat(gid, uid, "bounties_won", 1)
+            bal = await get_balance(gid, uid)
+            ans_raw = game["answer"]
+            ans_up = ans_raw.upper()
+            del bounty_games[gid]
+            await inter.followup.send(
+                f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{payout} {EMO_SHEKEL()}**! (Balance: {bal})"
+            )
+            definition = await fetch_definition(ans_raw)
+            fields = []
+            if definition:
+                fields.append(("Definition", definition, False))
+            fields.append(("Result", row, False))
+            emb = make_card(
+                title="🎯 Hourly Bounty — Solved",
+                description=f"{inter.user.mention} wins **{payout} {EMO_SHEKEL()}** by solving **{ans_up}**.",
+                fields=fields,
+                color=CARD_COLOR_SUCCESS,
+            )
+            await _announce_result(inter.guild, origin_cid=None, content="", embed=emb)
     else:
         await inter.followup.send("(Keep trying! Unlimited guesses.)")
 
@@ -3354,20 +3445,20 @@ async def bounty_loop():
                     continue
                 ch = guild.get_channel(pend["channel_id"])
 
-                # Suppress next-hour bounty ping
                 try:
                     await set_cfg(guild.id, suppress_bounty_ping=1)
                 except Exception:
                     pass
 
-                # +1 to next bounty
+
                 cfg = await get_cfg(guild.id)
                 bonus = int(cfg.get("next_bounty_bonus", 0)) + 1
                 await set_cfg(guild.id, next_bounty_bonus=bonus)
 
                 if isinstance(ch, discord.TextChannel):
+                    title = "⏲️ Worldle Royale prompt expired" if pend.get("mode") == "royale" else "⏲️ Bounty prompt expired"
                     emb = make_panel(
-                        title="⏲️ Bounty prompt expired",
+                        title=title,
                         description=f"+1 {EMO_SHEKEL()} to next bounty (now **{BOUNTY_PAYOUT + bonus}**).",
                     )
                     try:
@@ -3382,7 +3473,8 @@ async def bounty_loop():
     for gid, pend in list(pending_bounties.items()):
         try:
             arm_at = pend.get("arming_at")
-            if arm_at and now >= arm_at and len(pend.get("users", set())) >= 2:
+            need, _delay = _pend_requirements(pend)
+            if arm_at and now >= arm_at and len(pend.get("users", set())) >= need:
                 guild = discord.utils.get(bot.guilds, id=gid)
                 if not guild:
                     continue
@@ -3394,42 +3486,68 @@ async def bounty_loop():
                     except Exception:
                         await safe_send(ch, "🔔 **Arming now!**")
 
-                channel_id = pend["channel_id"]
-                pending_bounties.pop(gid, None)
-                await _start_bounty_after_gate(guild, channel_id)
+                await _start_bounty_after_gate(guild, pend)
         except Exception as e:
             log.warning(f"bounty_loop arming error (guild {gid}): {e}")
+
+
+    # 1.75) Increment Royale payouts
+    for gid, game in list(bounty_games.items()):
+        try:
+            if game.get("mode") == "royale" and now >= game.get("next_increase_at", float("inf")):
+                game["payout"] = game.get("payout", BOUNTY_PAYOUT) + 1
+                game["next_increase_at"] = now + 3600
+                guild = discord.utils.get(bot.guilds, id=gid)
+                if guild:
+                    ch = guild.get_channel(game["channel_id"])
+                    if isinstance(ch, discord.TextChannel):
+                        await safe_send(ch, f"⬆️ Royale prize pool increased to **{game['payout']} {EMO_SHEKEL()}**")
+        except Exception as e:
+            log.warning(f"bounty_loop royale increment error (guild {gid}): {e}")
 
     # 2) Expire ARMED bounties
     for gid, game in list(bounty_games.items()):
         try:
             if now >= game.get("expires_at", 0):
                 bounty_games.pop(gid, None)
+                pending_bounties.pop(gid, None)
                 guild = discord.utils.get(bot.guilds, id=gid)
                 if not guild:
                     continue
                 ch = guild.get_channel(game["channel_id"])
 
-                # Suppress next-hour ping
-                try:
-                    await set_cfg(guild.id, suppress_bounty_ping=1)
-                except Exception:
-                    pass
+                if game.get("mode") == "royale":
+                    try:
+                        await set_cfg(guild.id, suppress_bounty_ping=1, next_bounty_bonus=0)
+                    except Exception:
+                        pass
+                    if isinstance(ch, discord.TextChannel):
+                        emb = make_panel(
+                            title="⏲️ Worldle Royale expired",
+                            description=(
+                                f"No winner in **{BOUNTY_EXPIRE_MIN} minutes**.\n"
+                                f"Next bounty is **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**.",
+                            ),
+                        )
+                        await safe_send(ch, embed=emb)
+                else:
+                    try:
+                        await set_cfg(guild.id, suppress_bounty_ping=1)
+                    except Exception:
+                        pass
+                    cfg = await get_cfg(guild.id)
+                    bonus = int(cfg.get("next_bounty_bonus", 0)) + 1
+                    await set_cfg(guild.id, next_bounty_bonus=bonus)
 
-                # +1 to next bounty
-                cfg = await get_cfg(guild.id)
-                bonus = int(cfg.get("next_bounty_bonus", 0)) + 1
-                await set_cfg(guild.id, next_bounty_bonus=bonus)
-
-                if isinstance(ch, discord.TextChannel):
-                    emb = make_panel(
-                        title="⏲️ Bounty expired",
-                        description=(
-                            f"No solve in **{BOUNTY_EXPIRE_MIN} minutes**.\n"
-                            f"+1 {EMO_SHEKEL()} to next bounty (now **{BOUNTY_PAYOUT + bonus}**)."
-                        ),
-                    )
-                    await safe_send(ch, embed=emb)
+                    if isinstance(ch, discord.TextChannel):
+                        emb = make_panel(
+                            title="⏲️ Bounty expired",
+                            description=(
+                                f"No solve in **{BOUNTY_EXPIRE_MIN} minutes**.\n"
+                                f"+1 {EMO_SHEKEL()} to next bounty (now **{BOUNTY_PAYOUT + bonus}**).",
+                            ),
+                        )
+                        await safe_send(ch, embed=emb)
         except Exception as e:
             log.warning(f"bounty_loop active expiry error (guild {gid}): {e}")
 
@@ -3501,18 +3619,27 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 ch = guild.get_channel(pend["channel_id"])
                 if isinstance(ch, discord.TextChannel):
                     msg = await ch.fetch_message(pend["message_id"])
-                    cfg = await get_cfg(guild.id)
-                    bonus = int(cfg.get("next_bounty_bonus", 0))
-                    prize = BOUNTY_PAYOUT + bonus
-                    desc = (
-                        f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
-                        f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
-                        f"**Prize:** {prize} {EMO_SHEKEL()}\n"
-                        "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
-                        f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
-                    )
+                    prize = pend.get("payout", BOUNTY_PAYOUT)
+                    if pend.get("mode") == "royale":
+                        desc = (
+                            f"React with {EMO_BOUNTY()} to **join Worldle Royale** — need **{ROYALE_MIN_PLAYERS}** players.\n"
+                            f"After {ROYALE_MIN_PLAYERS} react, the royale **starts in {ROYALE_ARM_DELAY_S//60} minutes**.\n"
+                            f"**Prize pool:** {prize} {EMO_SHEKEL()}\n"
+                            "Use `bg APPLE` or `/worldle_bounty_guess` when started.\n\n"
+                            f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                        )
+                        title = f"{EMO_BOUNTY()} Worldle Royale"
+                    else:
+                        desc = (
+                            f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
+                            f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
+                            f"**Prize:** {prize} {EMO_SHEKEL()}\n"
+                            "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+                            f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                        )
+                        title = f"{EMO_BOUNTY()} Hourly Bounty (GMT)"
                     emb = make_panel(
-                        title=f"{EMO_BOUNTY()} Hourly Bounty (GMT)",
+                        title=title,
                         description=desc,
                         fields=[("Players ready", players_txt, False)],
                     )
@@ -3520,15 +3647,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             except Exception:
                 pass
 
-            # If we just reached 2 players, start the arming countdown (and box the notice)
-            if len(pend["users"]) >= 2 and not pend.get("arming_at"):
-                pend["arming_at"] = gmt_now_s() + BOUNTY_ARM_DELAY_S
+            need, delay = _pend_requirements(pend)
+            if len(pend["users"]) >= need and not pend.get("arming_at"):
+                pend["arming_at"] = gmt_now_s() + delay
                 try:
                     ch = guild.get_channel(pend["channel_id"])
-                    await send_boxed(
-                        ch, "Bounty", f"✅ Armed by {', '.join(names[:2])}. **Arming in {BOUNTY_ARM_DELAY_S//60} minute…**",
-                        icon="🎯"
+                    title = "Bounty" if pend.get("mode") != "royale" else "Royale"
+                    msg_txt = (
+                        f"✅ Armed by {', '.join(names[:need])}. **Arming in {delay//60} minute…**"
+                        if pend.get("mode") != "royale"
+                        else f"✅ Armed by {', '.join(names[:need])}. **Starting in {delay//60} minutes…**"
                     )
+                    await send_boxed(ch, title, msg_txt, icon="🎯")
                 except Exception:
                     pass
         return
@@ -3683,12 +3813,14 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         if not guild:
             return
 
-        # If countdown was running but we dropped below 2, cancel it (boxed)
-        if pend.get("arming_at") and len(pend["users"]) < 2:
+        # If countdown was running but we dropped below required players, cancel it (boxed)
+        need, _delay = _pend_requirements(pend)
+        if pend.get("arming_at") and len(pend["users"]) < need:
             pend["arming_at"] = None
             try:
                 ch = guild.get_channel(pend["channel_id"])
-                await send_boxed(ch, "Bounty", "⏹️ Arming **cancelled** — need 2 players again.", icon="🎯")
+                title = "Bounty" if pend.get("mode") != "royale" else "Royale"
+                await send_boxed(ch, title, f"⏹️ Arming **cancelled** — need {need} players again.", icon="🎯")
             except Exception:
                 pass
 
@@ -3705,18 +3837,27 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
                     except Exception:
                         names.append(f"<@{id_}>")
                 players_txt = ", ".join(names) if names else "—"
-                cfg = await get_cfg(guild.id)
-                bonus = int(cfg.get("next_bounty_bonus", 0))
-                prize = BOUNTY_PAYOUT + bonus
-                desc = (
-                    f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
-                    f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
-                    f"**Prize:** {prize} {EMO_SHEKEL()}\n"
-                    "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
-                    f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
-                )
+                prize = pend.get("payout", BOUNTY_PAYOUT)
+                if pend.get("mode") == "royale":
+                    desc = (
+                        f"React with {EMO_BOUNTY()} to **join Worldle Royale** — need **{ROYALE_MIN_PLAYERS}** players.\n"
+                        f"After {ROYALE_MIN_PLAYERS} react, the royale **starts in {ROYALE_ARM_DELAY_S//60} minutes**.\n"
+                        f"**Prize pool:** {prize} {EMO_SHEKEL()}\n"
+                        "Use `bg APPLE` or `/worldle_bounty_guess` when started.\n\n"
+                        f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                    )
+                    title = f"{EMO_BOUNTY()} Worldle Royale"
+                else:
+                    desc = (
+                        f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
+                        f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
+                        f"**Prize:** {prize} {EMO_SHEKEL()}\n"
+                        "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+                        f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                    )
+                    title = f"{EMO_BOUNTY()} Hourly Bounty (GMT)"
                 emb = make_panel(
-                    title=f"{EMO_BOUNTY()} Hourly Bounty (GMT)",
+                    title=title,
                     description=desc,
                     fields=[("Players ready", players_txt, False)],
                 )
