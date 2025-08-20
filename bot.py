@@ -84,16 +84,31 @@ WORLDLER_ROLE_NAME = "Worldler"
 BOUNTY_ROLE_NAME   = "Bounty Hunter"
 
 # -------------------- emoji helpers --------------------
+
+def EMO_GATE_SCROLL(tier: int) -> str:
+    """Return the custom gate scroll emoji for a given tier (1‑3)."""
+    return get_named_emoji(f"ww_t{tier}_gate_scroll")
+
+EMO_BADGE   = lambda: "<:ww_badge:1404182337230602343>"
+EMO_CHICKEN = lambda: "<:ww_chicken:1406752722002120704>"
+EMO_SHEKEL  = lambda: "<:ww_shekel:1406746588831027353>"
+EMO_STONE   = lambda: "<:ww_stone:1406746605842862100>"
+EMO_SNIPER  = lambda: "<:ww_sniper:1406747636429754508>"
+EMO_BOUNTY  = lambda: "<:ww_bounty:1406783901032251492>"
+EMO_DUNGEON = lambda: get_named_emoji("ww_gate")  # custom WW gate emoji
+
+
 def get_named_emoji(name: str) -> str:
     e = discord.utils.find(lambda em: em.name.lower() == name.lower(), bot.emojis)
     return str(e) if e else ""
 
-EMO_BADGE   = lambda: (get_named_emoji(EMO_BADGE_NAME)   or "🎖️")
-EMO_CHICKEN = lambda: (get_named_emoji(EMO_CHICKEN_NAME) or "🍗")
-EMO_SHEKEL  = lambda: (get_named_emoji(EMO_SHEKEL_NAME)  or "🪙")
-EMO_STONE   = lambda: (get_named_emoji(EMO_STONE_NAME)   or "🪨")
-EMO_SNIPER  = lambda: (get_named_emoji(EMO_SNIPER_NAME)  or "🎯")
-EMO_BOUNTY  = lambda: (get_named_emoji(EMO_BOUNTY_NAME)  or "🎯")
+EMO_BADGE   = lambda: "<:ww_badge:1404182337230602343>"
+EMO_CHICKEN = lambda: "<:ww_chicken:1406752722002120704>"
+EMO_SHEKEL  = lambda: "<:ww_shekel:1406746588831027353>"
+EMO_STONE   = lambda: "<:ww_stone:1406746605842862100>"
+EMO_SNIPER  = lambda: "<:ww_sniper:1406747636429754508>"
+EMO_BOUNTY  = lambda: "<:ww_bounty:1406783901032251492>"
+EMO_DUNGEON  = lambda: "<:ww_t3_gate_scroll:1406748502649733190>"
 
 # -------------------- deps sanity --------------------
 def log_deps_health():
@@ -395,6 +410,19 @@ async def db_init():
         guild_id INTEGER NOT NULL PRIMARY KEY,
         pot INTEGER NOT NULL DEFAULT 10)""")
 
+
+    # Track Word Pot plays per hour
+    await bot.db.execute(
+        """CREATE TABLE IF NOT EXISTS casino_attempts(
+            guild_id INTEGER NOT NULL,
+            user_id  INTEGER NOT NULL,
+            hour_idx INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(guild_id, user_id, hour_idx)
+        )"""
+    )
+
+
     # Anti-bully per-day stones
     await bot.db.execute("""CREATE TABLE IF NOT EXISTS stone_daily(
         guild_id INTEGER NOT NULL,
@@ -445,7 +473,7 @@ async def db_init():
     await add_column_if_missing(bot.db, "inv", "dungeon_tickets_t3", "INTEGER DEFAULT 0")
     await add_column_if_missing(bot.db, "guild_cfg", "suppress_bounty_ping", "INTEGER DEFAULT 0")
     await add_column_if_missing(bot.db, "guild_cfg", "drops_channel_id", "INTEGER")
-
+    await add_column_if_missing(bot.db, "guild_cfg", "next_bounty_bonus", "INTEGER DEFAULT 0")
 
 
 
@@ -457,6 +485,438 @@ async def db_init():
         await migrate_solo_daily_schema(bot.db)
     except Exception as e:
         log.warning(f"[db] solo_daily schema migration failed (will keep running): {e}")
+
+
+
+##-------------------------------------HELPERS----------------------------------
+
+
+# -------------------- Dungeon UI (paged) --------------------
+
+# 2 short-paragraph lore blurbs per tier (ancient wizards & lost knowledge theme)
+_DUNGEON_LORE = {
+    3: (
+        "Past a sealed lectern is a staircase that wasn’t there until you needed it. "
+        "Shelves drift like constellations; books never written sit beside those never allowed. "
+        "Invisible librarians reshelve fate.",
+
+        "The Arch-Archivist hid the **Index of Forgotten Things** here. Every answer has teeth. "
+        "You won’t leave unchanged—but if you are brave, you will leave **true**."
+    ),
+    2: (
+        "Beneath the archive is the **Scriptorium of Errata** where apprentices rewrote history "
+        "in erasable ink. The floor is a palimpsest of mistakes that learned to whisper.",
+
+        "Wards flicker; glyphs bargain. The **Corrector’s Quill** grants power but demands precision. "
+        "Those who rush their answers feed the quill more than ink."
+    ),
+    1: (
+        "At the root lies the **Redacted Sanctum**, where the First Wizard hid knowledge from even themself. "
+        "Light arrives late; echoes arrive early. Letters arrange themselves if you stare long enough.",
+
+        "A bell tolls when truth is near. Toll it too often and the room tolls back. "
+        "Answers here are heavy and must be lifted carefully."
+    ),
+}
+
+def _tier_stats(tier: int) -> tuple[int, int]:
+    """Returns (tries_per_round, reward_multiplier) using your code's rules:
+       T3=5×1, T2=4×2, T1=3×3."""
+    tries = 5 if tier == 3 else 4 if tier == 2 else 3
+    mult  = 1 if tier == 3 else 2 if tier == 2 else 3
+    return tries, mult
+
+def _loot_lines_for_tier(tier: int) -> list[str]:
+    """Matches your real loot logic:
+       • Every solve: +1 Stone
+       • T3: 10% chance → +1 Tier 2 Ticket
+       • T2: 10% chance → +1 Tier 1 Ticket
+       • T1: no ticket drops
+    """
+    lines = [f"• +1 {EMO_STONE()} on every solved word"]
+    if tier == 3:
+        lines.append("• 10% chance per solve → +1 Tier 2 Ticket")
+    elif tier == 2:
+        lines.append("• 10% chance per solve → +1 Tier 1 Ticket")
+    return lines
+
+async def _ticket_count_for(gid: int, uid: int, tier: int) -> int:
+    if tier == 3:
+        return await get_dungeon_tickets_t3(gid, uid)
+    elif tier == 2:
+        return await get_dungeon_tickets_t2(gid, uid)
+    else:
+        return await get_dungeon_tickets_t1(gid, uid)
+
+async def _build_dungeon_embed(gid: int, uid: int, page: str) -> discord.Embed:
+    """
+    page ∈ {"t1","t2","t3","rules"}
+    """
+    shek, stone = EMO_SHEKEL(), EMO_STONE()
+    if page == "rules":
+        desc = (
+            "Co-op Wordle, but perilous:\n"
+            "• Solve a word to add shekels to the **pool** (amount depends on attempt & tier multiplier).\n"
+            "• After each solve, the **owner** chooses: **Continue** (⏩) or **Cash Out** ().\n"
+            "• If a round **fails**, the pool is **halved (rounded up)** and paid, then the dungeon closes.\n"
+            "• Max tries per round depend on tier. T1 is hardest but pays the most per solve.\n"
+            "• Tickets are consumed on entry. T3 tickets are bought in /shop; T2/T1 drop in lower floors."
+        )
+        flds = [
+            ("Tries & Multipliers",
+             "• Tier 3: 5 tries · ×1 rewards\n"
+             "• Tier 2: 4 tries · ×2 rewards\n"
+             "• Tier 1: 3 tries · ×3 rewards",
+             False),
+            ("General Tips",
+             "• Bring friends; participants share the pool.\n"
+             "• Precision beats speed—wrong paths burn attempts.\n"
+             "• Cash out if the hint matrix looks grim.",
+             False),
+        ]
+        return make_panel(
+            title=f"{EMO_DUNGEON()} Dungeon — Rules",
+            description=desc,
+            fields=flds
+        )
+
+    tier = 3 if page == "t3" else 2 if page == "t2" else 1
+    tries, mult = _tier_stats(tier)
+    lore1, lore2 = _DUNGEON_LORE[tier]
+    tix = await _ticket_count_for(gid, uid, tier)
+
+    desc = f"**Tier {tier}** — {['','The Scriptorium of Errata','The Unbound Stacks'][tier-1] if tier!=1 else 'The Redacted Sanctum'}\n\n{lore1}\n\n{lore2}"
+    loot = "\n".join(_loot_lines_for_tier(tier))
+
+    flds = [
+        ("Rewards", f"Tier {tier} multiplier ×**{mult}** · **{tries}** tries per round", False),
+        ("Loot Table", loot, False),
+        ("To enter", f"Use **/worldle_dungeon tier:Tier {tier}** — or click the green button below.", False),
+    ]
+    return make_panel(
+        title=f"{EMO_DUNGEON()} Dungeon — Tier {tier}",
+        description=desc,
+        fields=flds
+    )
+
+
+class DungeonView(discord.ui.View):
+    """4-page dungeon guide; Enter button calls /worldle_dungeon and live-updates ticket count.
+       On the Rules page the Enter button is removed entirely.
+    """
+    def __init__(self, inter: discord.Interaction, start_tier: int = 3):
+        super().__init__(timeout=300)
+        self.inter = inter
+        self.guild_id = inter.guild.id
+        self.user_id = inter.user.id
+        self.page = f"t{start_tier}"  # 't1' | 't2' | 't3' | 'rules'
+        self.message: discord.Message | None = None  # set by the command after sending
+
+        # Attach custom gate scroll emojis to navigation + action buttons
+        for t, btn in ((1, self.t1_button), (2, self.t2_button), (3, self.t3_button)):
+            emo = EMO_GATE_SCROLL(t)
+            if emo:
+                btn.emoji = emo
+        emo = EMO_GATE_SCROLL(start_tier)
+        if emo:
+            self.enter_button.emoji = emo
+
+    # ---------- internal helpers ----------
+    def _current_tier(self) -> int:
+        if self.page == "t3":
+            return 3
+        if self.page == "t2":
+            return 2
+        return 1
+
+    def _has_enter_button(self) -> bool:
+        # Is the green button currently attached to the view?
+        return any(isinstance(child, discord.ui.Button) and child is self.enter_button for child in self.children)
+
+    async def refresh_page(self, i: discord.Interaction | None = None):
+        """Rebuild embed + sync presence/label of the Enter button."""
+        emb = await _build_dungeon_embed(self.guild_id, self.user_id, self.page)
+
+        # Manage presence of Enter button (remove on Rules; ensure present otherwise)
+        if self.page == "rules":
+            if self._has_enter_button():
+                self.remove_item(self.enter_button)
+        else:
+            if not self._has_enter_button():
+                # Re-attach the same Button instance so we don't lose its callback
+                self.add_item(self.enter_button)
+
+            # Update label with current ticket count and disable if 0
+            t = self._current_tier()
+            count = await _ticket_count_for(self.guild_id, self.user_id, t)
+            self.enter_button.label = f"Enter Dungeon — T{t} ({count} tickets)"
+            self.enter_button.disabled = (count <= 0)
+            emo = EMO_GATE_SCROLL(t)
+            if emo:
+                self.enter_button.emoji = emo
+
+        # Push UI
+        if i is not None:
+            try:
+                await i.response.edit_message(embed=emb, view=self)
+            except discord.InteractionResponded:
+                if self.message:
+                    await self.message.edit(embed=emb, view=self)
+        elif self.message is not None:
+            await self.message.edit(embed=emb, view=self)
+
+    # ---------- navigation ----------
+    @discord.ui.button(label="Tier 1", style=discord.ButtonStyle.secondary)
+    async def t1_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "t1"
+        await self.refresh_page(i)
+
+    @discord.ui.button(label="Tier 2", style=discord.ButtonStyle.secondary)
+    async def t2_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "t2"
+        await self.refresh_page(i)
+
+    @discord.ui.button(label="Tier 3", style=discord.ButtonStyle.secondary)
+    async def t3_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "t3"
+        await self.refresh_page(i)
+
+    @discord.ui.button(label="Rules", style=discord.ButtonStyle.secondary)
+    async def rules_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        self.page = "rules"
+        await self.refresh_page(i)
+
+    # ---------- primary action ----------
+    @discord.ui.button(label="Enter Dungeon", style=discord.ButtonStyle.success, row=1)
+    async def enter_button(self, i: discord.Interaction, _btn: discord.ui.Button):
+        """Invoke your /worldle_dungeon slash command, then refresh the ticket count."""
+        # Determine tier from current page (if on rules we shouldn't have this button at all)
+        t = self._current_tier()
+
+        # Look up the app command on your global tree and call its callback
+        cmd = tree.get_command("worldle_dungeon")  # keep this name in sync with your slash command
+        if cmd is None:
+            return await i.response.send_message("Dungeon command not found.", ephemeral=True)
+
+        choice = app_commands.Choice(name=f"Tier {t}", value=t)
+
+        binding = getattr(cmd, "binding", None)
+        if binding is not None:
+            await cmd.callback(binding, i, choice)
+        else:
+            await cmd.callback(i, choice)
+
+        # After the command runs, tickets might be consumed—refresh the label in-place.
+        # Use the stored message to avoid response state conflicts.
+        # A tiny yield lets anything deferred finish updating your storage.
+        await asyncio.sleep(0)
+        await self.refresh_page()  # edits self.message with new ticket count
+
+
+
+
+
+
+
+
+
+
+# --- Dailies helpers (UK reset) ---
+async def get_solo_wordles_left(guild_id: int, user_id: int) -> int:
+    """How many solo games remain today for this user (max 5/day, UK-local reset)."""
+    today = uk_today_str()
+    plays = await get_solo_plays_today(guild_id, user_id, today)
+    return max(0, 5 - int(plays))
+
+async def has_prayed_today(guild_id: int, user_id: int) -> bool:
+    """True if user already did /pray today (UK-local reset)."""
+    today = uk_today_str()
+    last_pray, _ = await _get_cd(guild_id, user_id)
+    return (last_pray == today)
+
+async def has_begged_today(guild_id: int, user_id: int) -> bool:
+    """True if user already did /beg today (UK-local reset)."""
+    today = uk_today_str()
+    _, last_beg = await _get_cd(guild_id, user_id)
+    return (last_beg == today)
+
+
+# --- Word Pot total (use casino pot) ---
+async def get_word_pot_total(guild_id: int) -> int:
+    """
+    Drop-in replacement: report the casino Word Pot amount.
+    """
+    try:
+        return await get_casino_pot(guild_id)
+    except Exception:
+        return 0
+
+
+
+async def _build_shop_embed(gid: int, uid: int) -> discord.Embed:
+    bal = await get_balance(gid, uid)
+    shek = EMO_SHEKEL()
+    lines = [
+        "🛒 **Shop** — buy with the buttons, or sell with the **💸 Sell** button (or `/sell`).",
+        "",
+        f"**Your balance:** **{bal} {shek}**",
+        "",
+    ]
+    for key in SHOP_ORDER:
+        item = SHOP_ITEMS[key]
+        price = item["price"]
+        lines.append(
+            f"• **{item['label']}** — {price} {shek}{'' if price==1 else 's'}\n  _{item['desc']}_"
+        )
+    lines.append("\nTip: For bulk buying via slash command, use `/buy item:{name} amount:{n}`.")
+    return make_panel("Shop", "\n".join(lines), icon="🛒")
+
+
+async def _build_sell_embed(gid: int, uid: int, owned: list[dict]) -> discord.Embed:
+    bal = await get_balance(gid, uid)
+    shek = EMO_SHEKEL()
+
+    if not owned:
+        desc = f"**Your balance:** **{bal} {shek}**\n\nYou currently have **nothing** you can sell."
+        return make_panel("Sell Items", desc, icon="🛍️")
+
+    lines = [f"**Your balance:** **{bal} {shek}**", "", "You can sell:"]
+    for it in owned:
+        lines.append(
+            f"• {it['emoji']} **{it['label']}** — you own **{it['count']}** · sell price **{it['price_each']} {shek}** each"
+        )
+
+    return make_panel(
+        title="Sell Items",
+        description="Pick an item from the selector below:",
+        fields=[("Details", "\n".join(lines), False)],
+        icon="🛍️",
+    )
+
+
+async def _get_owned_sellables(gid: int, uid: int) -> list[dict]:
+    stones   = await get_stones(gid, uid)
+    badge    = await get_badge(gid, uid)
+    chickens = await get_chickens(gid, uid)
+    sniper   = await get_sniper(gid, uid)
+    t3       = await get_dungeon_tickets_t3(gid, uid)
+
+    catalog = []
+    def _add(key: str, count: int, label: str, price_each: int, emoji: str):
+        if count and count > 0:
+            catalog.append({
+                "key": key,
+                "label": label,
+                "count": int(count),
+                "price_each": int(price_each),
+                "emoji": emoji,
+            })
+
+    _add("stone",     stones,   "Stone",                   SHOP_ITEMS["stone"]["price"],     EMO_STONE())
+    _add("badge",     badge,    "Bounty Hunter Badge",     SHOP_ITEMS["badge"]["price"],     EMO_BADGE())
+    _add("chicken",   chickens, "Fried Chicken",           SHOP_ITEMS["chicken"]["price"],   EMO_CHICKEN())
+    _add("sniper",    sniper,   "Sniper",                  SHOP_ITEMS["sniper"]["price"],    EMO_SNIPER())
+    _add("ticket_t3", t3,       "Dungeon Ticket (Tier 3)", SHOP_ITEMS["ticket_t3"]["price"], EMO_GATE_SCROLL(3))
+    return catalog
+
+
+
+async def _shop_perform_sell(i: discord.Interaction, key: str, qty: int):
+    """Performs a SELL and replies PUBLICLY (non-ephemeral) on both success and errors.
+       Mirrors the logic of the /sell command, but as a reusable helper for UI.
+    """
+    async def _send(msg: str):
+        return await send_boxed(i, "Shop — Sell", msg, icon="🛍️", ephemeral=False)
+
+    if not i.guild or not i.channel:
+        return await _send("Run this in a server.")
+
+    gid, uid, cid = i.guild.id, i.user.id, i.channel.id
+    key = str(key).strip().lower()
+
+    if qty <= 0:
+        return await _send("Quantity must be at least 1.")
+
+    # Stones
+    if key == "stone":
+        have = await get_stones(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many stones to sell.")
+        await change_stones(gid, uid, -qty)
+        refund = SHOP_ITEMS["stone"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_STONE()} Stone** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Badge (one-time)
+    if key == "badge":
+        have = await get_badge(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many badges to sell.")
+        await change_badge(gid, uid, -qty)
+        refund = SHOP_ITEMS["badge"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_BADGE()} Badge** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Chicken
+    if key == "chicken":
+        have = await get_chickens(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many chickens to sell.")
+        await change_chickens(gid, uid, -qty)
+        refund = SHOP_ITEMS["chicken"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_CHICKEN()} Chicken** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Sniper
+    if key == "sniper":
+        have = await get_sniper(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many snipers to sell.")
+        await change_sniper(gid, uid, -qty)
+        refund = SHOP_ITEMS["sniper"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_SNIPER()} Sniper** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    # Tier-3 Ticket
+    if key == "ticket_t3":
+        have = await get_dungeon_tickets_t3(gid, uid)
+        if have < qty:
+            return await _send("You don't have that many Tier-3 tickets to sell.")
+        await change_dungeon_tickets_t3(gid, uid, -qty)
+        refund = SHOP_ITEMS["ticket_t3"]["price"] * qty
+        await change_balance(gid, uid, refund, announce_channel_id=cid)
+        bal = await get_balance(gid, uid)
+        return await _send(f"Sold **{qty}× {EMO_GATE_SCROLL(3)} Tier-3 Ticket** for **{refund} {EMO_SHEKEL()}**. New balance: **{bal}**.")
+
+    return await _send("Can't sell that item here.")
+
+
+
+
+# -------------------- DUNGEON emojis/helpers --------------------
+EMO_DUNGEON_NAME = os.getenv("WW_DUNGEON_NAME", "ww_dungeon")
+
+def EMO_DUNGEON() -> str:
+    e = discord.utils.find(lambda em: em.name.lower() == EMO_DUNGEON_NAME.lower(), bot.emojis)
+    return str(e) if e else "🌀"  # fallback
+
+def _dungeon_join_emoji_matches(emoji: discord.PartialEmoji) -> bool:
+    if emoji.is_unicode_emoji():
+        return emoji.name == "🌀"
+    return (emoji.name or "").lower() == EMO_DUNGEON_NAME.lower()
+
+def _lock_emoji_matches(emoji: discord.PartialEmoji) -> bool:
+    return emoji.is_unicode_emoji() and emoji.name == "🔒"
+
+def _continue_emoji_matches(emoji: discord.PartialEmoji) -> bool:
+    return emoji.is_unicode_emoji() and emoji.name == "⏩"
+
+def _cashout_emoji_matches(emoji: discord.PartialEmoji) -> bool:
+    return emoji.is_unicode_emoji() and emoji.name == "💰"
 
 
 # ------- DB helpers -------
@@ -620,7 +1080,7 @@ async def get_cfg(gid: int):
     async with bot.db.execute(
         "SELECT bounty_channel_id, worldler_role_id, bounty_role_id, last_bounty_ts, "
         "solo_category_id, announcements_channel_id, last_bounty_hour, suppress_bounty_ping, "
-        "drops_channel_id FROM guild_cfg WHERE guild_id=?",
+        "drops_channel_id, next_bounty_bonus FROM guild_cfg WHERE guild_id=?",
         (gid,)
     ) as cur:
         row = await cur.fetchone()
@@ -630,11 +1090,13 @@ async def get_cfg(gid: int):
             "last_bounty_ts": row[3] or 0, "solo_category_id": row[4],
             "announcements_channel_id": row[5], "last_bounty_hour": row[6] or 0,
             "suppress_bounty_ping": row[7] or 0, "drops_channel_id": row[8],
+            "next_bounty_bonus": row[9] or 0,
         }
     return {
         "bounty_channel_id": None, "worldler_role_id": None, "bounty_role_id": None,
         "last_bounty_ts": 0, "solo_category_id": None, "announcements_channel_id": None,
         "last_bounty_hour": 0, "suppress_bounty_ping": 0, "drops_channel_id": None,
+        "next_bounty_bonus": 0,
     }
 
 async def set_cfg(gid: int, **kwargs):
@@ -643,9 +1105,9 @@ async def set_cfg(gid: int, **kwargs):
       INSERT INTO guild_cfg(
         guild_id, bounty_channel_id, worldler_role_id, bounty_role_id, last_bounty_ts,
         solo_category_id, announcements_channel_id, last_bounty_hour, suppress_bounty_ping,
-        drops_channel_id
+        drops_channel_id, next_bounty_bonus
       )
-      VALUES(?,?,?,?,?,?,?,?,?,?)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(guild_id) DO UPDATE SET
         bounty_channel_id=excluded.bounty_channel_id,
         worldler_role_id=excluded.worldler_role_id,
@@ -655,13 +1117,146 @@ async def set_cfg(gid: int, **kwargs):
         announcements_channel_id=excluded.announcements_channel_id,
         last_bounty_hour=excluded.last_bounty_hour,
         suppress_bounty_ping=excluded.suppress_bounty_ping,
-        drops_channel_id=excluded.drops_channel_id
+        drops_channel_id=excluded.drops_channel_id,
+        next_bounty_bonus=excluded.next_bounty_bonus
     """, (
         gid, cfg["bounty_channel_id"], cfg["worldler_role_id"], cfg["bounty_role_id"],
         cfg["last_bounty_ts"], cfg["solo_category_id"], cfg["announcements_channel_id"],
         cfg["last_bounty_hour"], cfg["suppress_bounty_ping"], cfg["drops_channel_id"],
+        cfg["next_bounty_bonus"],
     ))
     await bot.db.commit()
+
+# ---- SHOP helpers (buttons + slash share this) ----
+async def _shop_perform_buy(i: discord.Interaction, key: str, qty: int, *, _from_modal: bool = False):
+    """
+    Performs the shop purchase and replies:
+      • PUBLIC message on success
+      • Ephemeral message on validation / balance errors
+
+    Works whether called from a slash command, a button, or a modal (deferred).
+    """
+
+    async def _send(msg: str, *, ephemeral: bool = False):
+        return await send_boxed(
+            i,
+            title="Shop",
+            description=msg,
+            icon="🛒",
+            ephemeral=ephemeral,
+        )
+
+    if not i.guild or not i.channel:
+        return await _send("Run this in a server.", ephemeral=True)
+
+    gid, cid, uid = i.guild.id, i.channel.id, i.user.id
+
+    # Canonical catalog for buy prices (must match your SHOP_ITEMS)
+    CATALOG = {
+        "stone":     {"label": "Stone",                    "price": 1},
+        "badge":     {"label": "Bounty Hunter Badge",      "price": 5},
+        "chicken":   {"label": "Fried Chicken",            "price": 2},
+        "sniper":    {"label": "Sniper",                   "price": 100},
+        "ticket_t3": {"label": "Dungeon Ticket (Tier 3)",  "price": 5},
+    }
+    # Accept a few friendly aliases
+    ALIASES = {
+        "stones": "stone",
+        "bounty_hunter_badge": "badge",
+        "fried_chicken": "chicken",
+        "sniper_rifle": "sniper",
+        "tier3": "ticket_t3",
+        "tier_3": "ticket_t3",
+        "t3": "ticket_t3",
+        "t3_ticket": "ticket_t3",
+        "dungeon_ticket": "ticket_t3",
+        "ticket_t3": "ticket_t3",
+    }
+
+    key_norm = str(key).strip().lower().replace(" ", "_")
+    key_norm = ALIASES.get(key_norm, key_norm)
+
+    # Validate item & quantity
+    item = CATALOG.get(key_norm)
+    if not item:
+        return await _send(f"Unknown shop item: `{key}`.", ephemeral=True)
+    if qty <= 0:
+        return await _send("Quantity must be at least 1.", ephemeral=True)
+    if qty > 100_000:
+        return await _send("That quantity is too large. Try something smaller.", ephemeral=True)
+
+    # One-time items must be bought singly
+    if key_norm in ("badge", "sniper") and qty != 1:
+        return await _send("That item can only be bought one at a time.", ephemeral=True)
+
+    price = int(item["price"])
+    cost = price * qty
+
+    # Economy glue → your DB helpers
+    async def _get_balance(uid_: int) -> int:
+        return await get_balance(gid, uid_)
+
+    async def _add_balance(uid_: int, delta: int) -> None:
+        await change_balance(gid, uid_, delta, announce_channel_id=cid)
+
+    async def _inv_add(uid_: int, item_key: str, amount: int) -> None:
+        if item_key == "stone":
+            await change_stones(gid, uid_, amount)
+        elif item_key == "chicken":
+            await change_chickens(gid, uid_, amount)
+        elif item_key == "badge":
+            if await get_badge(gid, uid_) >= 1:
+                raise RuntimeError("You already own the Bounty Hunter Badge.")
+            await set_badge(gid, uid_, 1)
+            # Grant bounty role if we can
+            try:
+                rid = await ensure_bounty_role(i.guild)
+                role = i.guild.get_role(rid) if rid else None
+                member = i.guild.get_member(uid_) or await i.guild.fetch_member(uid_)
+                if role and member and bot_can_manage_role(i.guild, role):
+                    await member.add_roles(role, reason="Bought Bounty Hunter Badge")
+            except Exception as e:
+                log.warning(f"grant bounty role failed: {e}")
+        elif item_key == "sniper":
+            if await get_sniper(gid, uid_) >= 1:
+                raise RuntimeError("You already own the Sniper.")
+            await set_sniper(gid, uid_, 1)
+        elif item_key == "ticket_t3":
+            await change_dungeon_tickets_t3(gid, uid_, amount)
+        else:
+            raise RuntimeError(f"Unhandled inventory item: {item_key}")
+
+    balance = await _get_balance(uid)
+    if balance < cost:
+        short = cost - balance
+        return await _send(
+            f"Not enough shekels: need **{short}** more (cost **{cost}**, you have **{balance}**).",
+            ephemeral=True,
+        )
+
+    # Charge and deliver
+    try:
+        await _add_balance(uid, -cost)
+        await _inv_add(uid, key_norm, qty)
+    except RuntimeError as e:
+        # Refund if inventory op failed for a known reason
+        try:
+            await _add_balance(uid, +cost)
+        except Exception:
+            pass
+        return await _send(str(e), ephemeral=True)
+
+    new_balance = await _get_balance(uid)
+    label = item["label"]
+
+    # PUBLIC success message
+    await _send(
+        f"**{i.user.mention}** bought **{qty}× {label}** for **{cost}** {EMO_SHEKEL()}. "
+        f"New balance: **{new_balance}**.",
+        ephemeral=False,
+    )
+
+
 
 
 
@@ -730,6 +1325,35 @@ async def set_casino_pot(gid: int, pot_val: int):
       ON CONFLICT(guild_id) DO UPDATE SET pot=excluded.pot
     """, (gid, pot_val))
     await bot.db.commit()
+    # 🔄 refresh any open /dailies panels in this guild
+    try:
+        await DailiesView.refresh_pot_label_for_guild(gid)
+    except Exception as e:
+        log.warning(f"[dailies] pot refresh failed for guild {gid}: {e}")
+
+
+# NEW: Word Pot attempt limit helpers
+async def get_word_pot_attempts(gid: int, uid: int, hour_idx: int) -> int:
+    async with bot.db.execute(
+        "SELECT attempts FROM casino_attempts WHERE guild_id=? AND user_id=? AND hour_idx=?",
+        (gid, uid, hour_idx),
+    ) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+async def inc_word_pot_attempts(gid: int, uid: int, hour_idx: int):
+    await bot.db.execute(
+        """
+        INSERT INTO casino_attempts(guild_id, user_id, hour_idx, attempts)
+        VALUES(?,?,?,1)
+        ON CONFLICT(guild_id, user_id, hour_idx)
+        DO UPDATE SET attempts = casino_attempts.attempts + 1
+        """,
+        (gid, uid, hour_idx),
+    )
+    await bot.db.commit()
+
+  
 
 # ------- streak helpers -------
 async def _get_streak(gid: int, uid: int):
@@ -933,8 +1557,8 @@ async def ensure_default_tiers(guild: discord.Guild):
 
 # -------------------- state --------------------
 solo_games: dict[Tuple[int,int,int], dict] = {}     # (gid, cid, uid) -> {answer, guesses[], max, legend, origin_cid}
-bounty_games: dict[int, dict] = {}                  # gid -> {answer, channel_id, started_at}
-pending_bounties: dict[int, dict] = {}              # gid -> {message_id, channel_id, users:set, hour_idx}
+bounty_games: dict[int, dict] = {}                  # gid -> {answer, channel_id, started_at, mode?, participants?, payout}
+pending_bounties: dict[int, dict] = {}              # gid -> {message_id, channel_id, users:set, hour_idx, mode?, payout, arming_at?}
 duels: dict[int, dict] = {}                         # duel_id -> data
 _next_duel_id = 1
 solo_channels: dict[Tuple[int,int], int] = {}       # (gid, uid) -> channel_id
@@ -1235,14 +1859,24 @@ async def solo_start(invocation_channel: discord.TextChannel, user: discord.Memb
 
     plays = await get_solo_plays_today(gid, uid, today)
     if plays >= 5:
-        await invocation_channel.send(f"{user.mention} you've reached your **5 solo games** for today. Resets at **00:00 UK time**.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(
+            invocation_channel,
+            "Solo Wordle",
+            f"{user.mention} you've reached your **5 solo games** for today. Resets at **00:00 UK time**.",
+            icon="🧩",
+        )
         return None
 
     existing_cid = solo_channels.get((gid, uid))
     if existing_cid and _key(gid, existing_cid, uid) in solo_games:
         ch = invocation_channel.guild.get_channel(existing_cid)
         if isinstance(ch, discord.TextChannel):
-            await invocation_channel.send(f"{user.mention} you already have a game running: {ch.mention}", allowed_mentions=discord.AllowedMentions.none())
+            await send_boxed(
+                invocation_channel,
+                "Solo Wordle",
+                f"{user.mention} you already have a game running: {ch.mention}",
+                icon="🧩",
+            )
             return ch
         else:
             solo_channels.pop((gid, uid), None)
@@ -1258,7 +1892,7 @@ async def solo_start(invocation_channel: discord.TextChannel, user: discord.Memb
         "legend": {},
         "origin_cid": invocation_channel.id,
         "start_date": uk_today_str(),  # record which UK day this slot was consumed
-        "snipers_tried": set(),        # NEW: shooters who already took a shot at THIS game
+        "snipers_tried": set(),        # shooters who already took a shot at THIS game
     }
     solo_channels[(gid, uid)] = ch.id
     await inc_solo_plays_today(gid, uid, today)
@@ -1266,47 +1900,57 @@ async def solo_start(invocation_channel: discord.TextChannel, user: discord.Memb
     if plays == 0:
         await update_streak_on_play(gid, uid, today)
 
-    board = render_board(solo_games[_key(gid, ch.id, uid)]["guesses"])
     left = 5 - (plays + 1)
-    await ch.send(
-        f"{user.mention} 🎮 **Your Wordle is ready!** (today’s uses left after this: **{left}**)\n"
-        f"You have **5 tries**.\nPayouts if you solve: 1st=5, 2nd=4, 3rd=3, 4th=2, 5th=1.",
-        allowed_mentions=discord.AllowedMentions(users=[user])
+    await send_boxed(
+        ch,
+        "Solo — Your Wordle is ready",
+        (
+            f"{user.mention} You have **5 tries**.\n"
+            "Payouts if you solve: 1st=5, 2nd=4, 3rd=3, 4th=2, 5th=1.\n"
+            f"Today’s uses left **after this**: **{left}**."
+        ),
+        icon="🧩",
     )
-    await ch.send(board)
+    board = render_board(solo_games[_key(gid, ch.id, uid)]["guesses"])
+    await ch.send(board)  # board stays unboxed/plain
     return ch
+
 
 
 
 async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: str):
     gid, cid, uid = channel.guild.id, channel.id, user.id
-    game = solo_games.get(_key(gid,cid,uid))
+    game = solo_games.get(_key(gid, cid, uid))
     if not game:
-        await channel.send(f"{user.mention} no game here. Start with `w` or `/worldle`.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(channel, "Solo Wordle", f"{user.mention} no game here. Start with `w` or `/worldle`.", icon="🧩")
         return
 
     cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
     if len(cleaned) != 5:
-        await channel.send("Guess must be **exactly 5 letters**."); return
+        await send_boxed(channel, "Invalid Guess", "Guess must be **exactly 5 letters**.", icon="❗")
+        return
     if not is_valid_guess(cleaned):
-        await channel.send("That’s not in the Wordle dictionary (UK variants supported)."); return
+        await send_boxed(channel, "Invalid Guess", "That’s not in the Wordle dictionary (UK variants supported).", icon="📚")
+        return
     if len(game["guesses"]) >= game["max"]:
-        await channel.send("Out of tries! Start a new one with `w`."); return
+        await send_boxed(channel, "Solo Wordle", "Out of tries! Start a new one with `w`.", icon="🧩")
+        return
 
     colors = score_guess(cleaned, game["answer"])
     game["guesses"].append({"word": cleaned, "colors": colors})
     update_legend(game["legend"], cleaned, colors)
 
     board = render_board(game["guesses"])
+    await channel.send(board)  # keep the board as plain text
+
     attempt = len(game["guesses"])
 
-    await channel.send(board)
-
     def _cleanup():
-        solo_games.pop(_key(gid,cid,uid), None)
+        solo_games.pop(_key(gid, cid, uid), None)
         if solo_channels.get((gid, uid)) == cid:
             solo_channels.pop((gid, uid), None)
 
+    # WIN
     if cleaned == game["answer"]:
         payout = payout_for_attempt(attempt)
         if payout:
@@ -1316,23 +1960,28 @@ async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: s
         ans = game["answer"].upper()
         _cleanup()
 
-        await channel.send(
-            f"🎉 {user.mention} solved it on attempt **{attempt}**! **Word: {ans}** · Payout **{payout} {EMO_SHEKEL()}**. Balance **{bal_new}**.",
-            allowed_mentions=discord.AllowedMentions.none()
+        await send_boxed(
+            channel,
+            "🏁 Solo — Solved!",
+            f"{user.mention} solved **{ans}** on attempt **{attempt}** and earned **{payout} {EMO_SHEKEL()}**.\nBalance **{bal_new}**",
+            icon="🎉",
         )
 
         emb = make_card(
             title="🏁 Solo — Finished",
             description=f"{user.mention} solved **{ans}** in **{attempt}** tries and earned **{payout} {EMO_SHEKEL()}**.",
-            fields=[("Board", board, False)],  # <-- no code block
+            fields=[("Board", board, False)],
             color=CARD_COLOR_SUCCESS,
         )
         await _announce_result(channel.guild, origin_cid, content="", embed=emb)
 
-        try: await channel.delete(reason="Wordle World solo finished (win)")
-        except Exception: pass
+        try:
+            await channel.delete(reason="Wordle World solo finished (win)")
+        except Exception:
+            pass
         return
 
+    # FAIL (out of tries)
     if attempt == game["max"]:
         ans_raw = game["answer"]
         ans = ans_raw.upper()
@@ -1342,12 +1991,13 @@ async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: s
         _cleanup()
         await inc_stat(gid, uid, "solo_fails", 1)
         bal_now = await get_balance(gid, uid)
-        def_line = f"\n📖 Definition: {definition}" if definition else ""
-        await channel.send(f"❌ Out of tries. The word was **{ans}** — {quip}{def_line}\nBalance **{bal_now}**.")
 
+        desc = f"❌ Out of tries. The word was **{ans}** — {quip}\nBalance **{bal_now}**."
         fields = [("Board", board, False)]
         if definition:
             fields.append(("Definition", definition, False))
+        await send_boxed(channel, "💀 Solo — Failed", desc, icon="💀", fields=fields)
+
         emb = make_card(
             title="💀 Solo — Failed",
             description=f"{user.mention} failed their Worldle. The word was **{ans}** — {quip}",
@@ -1356,80 +2006,112 @@ async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: s
         )
         await _announce_result(channel.guild, origin_cid, content="", embed=emb)
 
-        try: await channel.delete(reason="Wordle World solo finished (out of tries)")
-        except Exception: pass
+        try:
+            await channel.delete(reason="Wordle World solo finished (out of tries)")
+        except Exception:
+            pass
         return
 
+    # MID-GAME STATUS (box the legend)
     next_attempt = attempt + 1
     legend = legend_overview(game["legend"], game["guesses"])
     payout = payout_for_attempt(next_attempt)
-    msg = f"Attempt **{attempt}/{game['max']}** — If you solve on attempt **{next_attempt}**, payout will be **{payout}**."
-    if legend: msg += f"\n{legend}"
-    await channel.send(msg)
+    status = f"Attempt **{attempt}/{game['max']}** — If you solve on attempt **{next_attempt}**, payout will be **{payout}**."
+    flds = [("Next", status, False)]
+    if legend:
+        flds.append(("Legend", legend, False))
+    await send_boxed(channel, "Solo — Status", "", icon="🧩", fields=flds)
+
 
 
 
 
 # -------------------- CASINO: Word Pot (new) --------------------
-async def casino_start_word_pot(invocation_channel: discord.TextChannel, user: discord.Member) -> Optional[discord.TextChannel]:
+async def casino_start_word_pot(
+    invocation_channel: discord.TextChannel,
+    user: discord.Member
+) -> Optional[discord.TextChannel]:
     gid, uid = invocation_channel.guild.id, user.id
 
     bal = await get_balance(gid, uid)
     if bal < 1:
-        await invocation_channel.send(f"{user.mention} you need **1 {EMO_SHEKEL()}** to play Word Pot.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(invocation_channel, "Word Pot",
+                         f"{user.mention} you need **1 {EMO_SHEKEL()}** to play.",
+                         icon="🎰")
         return None
 
     existing_cid = casino_channels.get((gid, uid))
     if existing_cid and _key(gid, existing_cid, uid) in casino_games:
         ch = invocation_channel.guild.get_channel(existing_cid)
         if isinstance(ch, discord.TextChannel):
-            await invocation_channel.send(f"{user.mention} you already have a Word Pot game running: {ch.mention}", allowed_mentions=discord.AllowedMentions.none())
+            await send_boxed(invocation_channel, "Word Pot",
+                             f"{user.mention} you already have a game running: {ch.mention}",
+                             icon="🎰")
             return ch
         else:
             casino_channels.pop((gid, uid), None)
+
+    hour_idx = current_hour_index_gmt()
+    attempts = await get_word_pot_attempts(gid, uid, hour_idx)
+    if attempts >= 5:
+        await send_boxed(invocation_channel, "Word Pot",
+                         f"{user.mention} you have reached the **5 plays/hour** limit.",
+                         icon="🎰")
+        return None
 
     ch = await _make_private_solo_channel(invocation_channel, user)
     if not ch:
         return None
 
+    await inc_word_pot_attempts(gid, uid, hour_idx)
+
     # charge entry
     await change_balance(gid, uid, -1, announce_channel_id=ch.id)
 
     casino_games[_key(gid, ch.id, uid)] = {
-        "answer": random.choice(ANSWERS), "guesses": [], "max": 3, "legend": {}, "origin_cid": invocation_channel.id, "staked": 1
+        "answer": random.choice(ANSWERS),
+        "guesses": [],
+        "max": 3,
+        "legend": {},
+        "origin_cid": invocation_channel.id,
+        "staked": 1,
     }
     casino_channels[(gid, uid)] = ch.id
 
     pot = await get_casino_pot(gid)
-    board = render_board(casino_games[_key(gid, ch.id, uid)]["guesses"], total_rows=3)
-    await ch.send(
-        f"{user.mention} 🎰 **Word Pot** is live!\n"
-        f"• Entry: **1 {EMO_SHEKEL()}** (already paid)\n"
-        f"• Current Pot: **{pot} {EMO_SHEKEL()}** (resets to {CASINO_BASE_POT} on win)\n"
-        f"• You have **3 tries** — solve within 3 to **win the pot**.\n"
-        f"If you fail, your entry adds **+1** to the pot.",
-        allowed_mentions=discord.AllowedMentions(users=[user])
+    await send_boxed(
+        ch,
+        "🎰 Word Pot",
+        (
+            f"{user.mention} • Entry: **1 {EMO_SHEKEL()}** (paid)\n"
+            f"• Current Pot: **{pot} {EMO_SHEKEL()}** (resets to {CASINO_BASE_POT} on win)\n"
+            "• You have **3 tries** — solve within 3 to **win the pot**.\n"
+            "If you fail, your entry adds **+1** to the pot."
+        ),
+        icon="🎰",
     )
-    await ch.send(board)
+    board = render_board(casino_games[_key(gid, ch.id, uid)]["guesses"], total_rows=3)
+    await ch.send(board)  # board as plain text
     return ch
+
+
 
 async def casino_guess(channel: discord.TextChannel, user: discord.Member, word: str):
     gid, cid, uid = channel.guild.id, channel.id, user.id
     game = casino_games.get(_key(gid, cid, uid))
     if not game:
-        await safe_send(channel, f"{user.mention} no Word Pot game here. Start with `/worldle_casino`.",
-                        allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(channel, "Word Pot", f"{user.mention} no Word Pot game here. Start with `/worldle_casino`.", icon="🎰")
         return
 
     cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
     if len(cleaned) != 5:
-        await safe_send(channel, "Guess must be **exactly 5 letters**.")
+        await send_boxed(channel, "Invalid Guess", "Guess must be **exactly 5 letters**.", icon="❗")
         return
     if not is_valid_guess(cleaned):
-        await safe_send(channel, "That’s not in the Wordle dictionary (UK variants supported).")
+        await send_boxed(channel, "Invalid Guess", "That’s not in the Wordle dictionary (UK variants supported).", icon="📚")
         return
     if len(game["guesses"]) >= game["max"]:
-        await safe_send(channel, "Out of tries! Start a new one with `/worldle_casino`.")
+        await send_boxed(channel, "Word Pot", "Out of tries! Start a new one with `/worldle_casino`.", icon="🎰")
         return
 
     colors = score_guess(cleaned, game["answer"])
@@ -1438,7 +2120,7 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
     attempt = len(game["guesses"])
 
     board = render_board(game["guesses"], total_rows=3)
-    await safe_send(channel, board)
+    await safe_send(channel, board)  # board stays plain
 
     def _cleanup():
         casino_games.pop(_key(gid, cid, uid), None)
@@ -1455,17 +2137,18 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
         _cleanup()
         await set_casino_pot(gid, CASINO_BASE_POT)
 
-        await safe_send(
+        await send_boxed(
             channel,
-            f"🏆 {user.mention} solved **{ans}** on attempt **{attempt}** and **WON {pot} {EMO_SHEKEL()}**! "
-            f"Pot resets to **{CASINO_BASE_POT}**. (Balance: {bal_new})"
+            "🏆 Word Pot — WIN",
+            f"{user.mention} solved **{ans}** on attempt **{attempt}** and **WON {pot} {EMO_SHEKEL()}**!\nPot resets to **{CASINO_BASE_POT}**. (Balance: {bal_new})",
+            icon="🎰",
         )
 
         emb = make_card(
             title="🎰 Word Pot — WIN",
             description=f"{user.mention} won **{pot} {EMO_SHEKEL()}** by solving **{ans}** on attempt **{attempt}**.",
             fields=[
-                ("Board", board, False),                          # <-- no code block
+                ("Board", board, False),
                 ("Next Pot", f"Resets to **{CASINO_BASE_POT}**", True),
             ],
             color=CARD_COLOR_SUCCESS,
@@ -1491,15 +2174,17 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
         origin_cid = game.get("origin_cid")
         _cleanup()
 
-        await safe_send(
-            channel,
-            f"❌ Out of tries. The word was **{ans}** — {quip}{f'\\n📖 Definition: {definition}' if definition else ''}\n"
-            f"The pot increases to **{new_pot} {EMO_SHEKEL()}**."
-        )
-
         fields = [("Board", board, False), ("Pot", f"Now **{new_pot} {EMO_SHEKEL()}**", True)]
         if definition:
             fields.append(("Definition", definition, False))
+
+        await send_boxed(
+            channel,
+            "🎰 Word Pot — Failed",
+            f"❌ The word was **{ans}** — {quip}",
+            icon="🎰",
+            fields=fields,
+        )
 
         emb = make_card(
             title="🎰 Word Pot — Failed",
@@ -1515,12 +2200,274 @@ async def casino_guess(channel: discord.TextChannel, user: discord.Member, word:
             pass
         return
 
-    # mid-game hint
+    # MID-GAME STATUS (box the legend)
     legend = legend_overview(game["legend"], game["guesses"])
     msg = f"Attempt **{attempt}/3** — solve within **3** to win the pot."
+    flds = [("Next", msg, False)]
     if legend:
-        msg += f"\n{legend}"
-    await safe_send(channel, msg)
+        flds.append(("Legend", legend, False))
+    await send_boxed(channel, "Word Pot — Status", "", icon="🎰", fields=flds)
+
+
+# --- Quantity modal: defer first, then buy; success is PUBLIC ---
+class QuantityModal(discord.ui.Modal):
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        owner_id: int,
+        panel_channel_id: int,
+        panel_message_id: int,
+    ):
+        super().__init__(title=f"Buy {label}")
+        self.key = key
+        self.label = label
+        self.owner_id = int(owner_id)
+        self.panel_channel_id = int(panel_channel_id)
+        self.panel_message_id = int(panel_message_id)
+
+        self.amount = discord.ui.TextInput(
+            label="Quantity to buy",
+            placeholder="Enter a positive whole number",
+            required=True,
+            min_length=1,
+            max_length=6,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner_id:
+            return await send_boxed(
+                interaction, "Shop", "This shop view isn’t yours. Use **/shop** to open your own.", icon="🛒"
+            )
+
+        # validate
+        try:
+            qty = int(str(self.amount.value).strip())
+        except ValueError:
+            return await send_boxed(interaction, "Shop", "Enter a whole number.", icon="🛒")
+        if qty <= 0:
+            return await send_boxed(interaction, "Shop", "Enter a quantity greater than **0**.", icon="🛒")
+
+        # don’t block UI
+        try:
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
+
+        # do the buy (public confirmation)
+        # NOTE: keep this call name the same as in your codebase if different.
+        await _shop_perform_buy(interaction, self.key, qty)
+
+        # refresh the original Shop message so the balance updates
+        try:
+            gid, uid = interaction.guild.id, interaction.user.id
+            emb = await _build_shop_embed(gid, uid)
+
+            channel = interaction.client.get_channel(self.panel_channel_id) or await interaction.client.fetch_channel(self.panel_channel_id)
+            msg = await channel.fetch_message(self.panel_message_id)
+
+            view = ShopView(interaction)
+            view.message = msg
+            await msg.edit(embed=emb, view=view)
+        except Exception:
+            # swallow refresh errors to avoid breaking the purchase flow
+            pass
+
+
+
+class SellQuantityModal(discord.ui.Modal):
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        max_qty: int,
+        price_each: int,
+        owner_id: int | None,
+        panel_channel_id: int,
+        panel_message_id: int,
+    ):
+        super().__init__(title=f"Sell {label}")
+        self.key = key
+        self.label = label
+        self.max_qty = int(max_qty)
+        self.price_each = int(price_each)
+        self.owner_id = owner_id
+        self.panel_channel_id = int(panel_channel_id)
+        self.panel_message_id = int(panel_message_id)
+
+        hint = f"You own {self.max_qty}. Price each: {self.price_each} {EMO_SHEKEL()}."
+        self.amount = discord.ui.TextInput(
+            label="Quantity to sell",
+            placeholder=f"Enter 1–{self.max_qty}  ({hint})",
+            required=True,
+            min_length=1,
+            max_length=6,
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if self.owner_id and interaction.user.id != int(self.owner_id):
+            return await send_boxed(interaction, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
+
+        try:
+            qty = int(str(self.amount.value).strip())
+        except ValueError:
+            return await send_boxed(interaction, "Shop — Sell", "Enter a whole number.", icon="🛍️")
+        if qty <= 0 or qty > self.max_qty:
+            return await send_boxed(interaction, "Shop — Sell", f"Enter **1–{self.max_qty}**.", icon="🛍️")
+
+        try:
+            await interaction.response.defer(thinking=False)
+        except Exception:
+            pass
+
+        # Perform the sale (public confirmation message)
+        await _shop_perform_sell(interaction, self.key, qty)
+
+        # Refresh the Sell panel (balance + counts)
+        try:
+            gid, uid = interaction.guild.id, interaction.user.id
+            owned = await _get_owned_sellables(gid, uid)
+            emb = await _build_sell_embed(gid, uid, owned)
+
+            channel = interaction.client.get_channel(self.panel_channel_id) or await interaction.client.fetch_channel(self.panel_channel_id)
+            msg = await channel.fetch_message(self.panel_message_id)
+
+            view = SellMenuView(interaction, owned)
+            view.message = msg
+            await msg.edit(embed=emb, view=view)
+        except Exception:
+            pass
+
+
+
+
+
+
+class ShopView(discord.ui.View):
+    """Buttons open a quantity modal (buy) or switch to the Sell panel. Success messages are PUBLIC."""
+    def __init__(self, inter: discord.Interaction, *, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.owner_id = inter.user.id
+        self.guild_id = inter.guild.id
+        self.message: Optional[discord.Message] = None  # set by /shop after send
+
+        def add_buy_btn(key: str, label: str, emoji: str, style: discord.ButtonStyle):
+            btn = discord.ui.Button(label=label, emoji=emoji, style=style)
+
+            async def _cb(i: discord.Interaction, _key=key, _label=label):
+                if i.user.id != self.owner_id:
+                    return await send_boxed(i, "Shop", "This shop view isn’t yours. Use **/shop** to open your own.", icon="🛒")
+                # pass panel ids so the modal can refresh the same message after purchase
+                await i.response.send_modal(
+                    QuantityModal(
+                        _key,
+                        _label,
+                        self.owner_id,
+                        panel_channel_id=i.channel.id,
+                        panel_message_id=self.message.id if self.message else i.message.id,
+                    )
+                )
+
+            btn.callback = _cb
+            self.add_item(btn)
+
+        # Buy buttons
+        add_buy_btn("stone",     "Stone",     EMO_STONE(),   discord.ButtonStyle.primary)
+        add_buy_btn("badge",     "Badge",     EMO_BADGE(),   discord.ButtonStyle.secondary)
+        add_buy_btn("chicken",   "Chicken",   EMO_CHICKEN(), discord.ButtonStyle.secondary)
+        add_buy_btn("sniper",    "Sniper",    EMO_SNIPER(),  discord.ButtonStyle.secondary)
+        add_buy_btn("ticket_t3", "T3 Ticket", EMO_GATE_SCROLL(3), discord.ButtonStyle.success)
+
+        # SELL (red) — replaces this message with the Sell menu
+        sell_btn = discord.ui.Button(label="Sell", emoji="💸", style=discord.ButtonStyle.danger)
+
+        async def _sell_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await send_boxed(i, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
+            owned = await _get_owned_sellables(i.guild.id, i.user.id)
+            emb = await _build_sell_embed(i.guild.id, i.user.id, owned)
+            view = SellMenuView(i, owned)
+            view.message = self.message
+            await i.response.edit_message(embed=emb, view=view)
+
+        sell_btn.callback = _sell_cb
+        self.add_item(sell_btn)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
+
+
+
+
+
+
+class SellMenuView(discord.ui.View):
+    def __init__(self, inter: discord.Interaction, owned: list[dict], *, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.owner_id = inter.user.id
+        self.guild_id = inter.guild.id
+        self.channel_id = inter.channel.id
+        self.message: Optional[discord.Message] = None
+        self.owned = owned
+
+        # Select with owned items
+        options = []
+        for item in owned:
+            label = f"{item['emoji']} {item['label']}"
+            desc = f"Owned: {item['count']} • Sell price: {item['price_each']} each"
+            options.append(discord.SelectOption(label=label, value=item["key"], description=desc))
+
+        select = discord.ui.Select(placeholder="Pick an item to sell…", options=options)
+
+        async def _on_pick(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await send_boxed(i, "Shop — Sell", "This sell panel isn’t yours. Use **/shop** to open your own.", icon="🛍️")
+
+            await i.response.send_modal(
+                SellQuantityModal(
+                    key=select.values[0],
+                    label=next(x["label"] for x in self.owned if x["key"] == select.values[0]),
+                    max_qty=next(x["count"] for x in self.owned if x["key"] == select.values[0]),
+                    price_each=next(x["price_each"] for x in self.owned if x["key"] == select.values[0]),
+                    owner_id=self.owner_id,
+                    panel_channel_id=self.channel_id,
+                    panel_message_id=self.message.id if self.message else i.message.id,
+                )
+            )
+
+        select.callback = _on_pick
+        self.add_item(select)
+
+        # Back to Shop
+        back_btn = discord.ui.Button(label="Shop", emoji="🛒", style=discord.ButtonStyle.primary)
+
+        async def _back(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await send_boxed(i, "Shop", "This shop view isn’t yours. Use **/shop** to open your own.", icon="🛒")
+            emb = await _build_shop_embed(self.guild_id, self.owner_id)
+            view = ShopView(i)
+            view.message = self.message
+            await i.response.edit_message(embed=emb, view=view)
+
+        back_btn.callback = _back
+        self.add_item(back_btn)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
 
 
 
@@ -1652,7 +2599,7 @@ def build_help_pages(guild_name: str | None = None) -> list[discord.Embed]:
     emb.add_field(name="Admin Setup", value="• **/worldle_bounty_setchannel** to choose the channel.", inline=False)
     emb.add_field(name="Manual Drop", value="• **/worldle_bounty_now** posts a prompt immediately.", inline=False)
     emb.add_field(name="Play", value="• **`bg WORD`** or **/worldle_bounty_guess word:WORD**", inline=False)
-    emb.add_field(name="Reward", value=f"• First solver wins **{BOUNTY_PAYOUT} {shek}**.", inline=False)
+    emb.add_field(name="Reward", value=f"• First solver wins **{BOUNTY_PAYOUT} {shek}** (+1 for each expired bounty).", inline=False)
     pages.append(emb)
 
     # 6) Duels
@@ -1728,130 +2675,248 @@ BOUNTY_EXPIRE_S = BOUNTY_EXPIRE_MIN * 60
 BOUNTY_ARM_DELAY_S = 60          # wait 60s after 2 reactions before arming
 BOUNTY_GUESS_COOLDOWN_S = 5      # 5s per-user cooldown between guesses
 
+# Worldle Royale constants
+ROYALE_MIN_PLAYERS = 4
+ROYALE_ARM_DELAY_S = 600  # 10 minutes
+
+
 # Track last guess time per (guild_id, user_id) for the bounty
 last_bounty_guess_ts: dict[tuple[int, int], int] = {}
 
 
 
-async def _build_dailies_embed(guild: discord.Guild, user: discord.Member) -> discord.Embed:
-    """Boxed summary of daily actions + your current status (UK-time resets)."""
-    gid, uid = guild.id, user.id
-    today = uk_today_str()
+async def _build_dailies_embed(guild_id: int, user_id: int) -> discord.Embed:
+    solo_left   = await get_solo_wordles_left(guild_id, user_id)
+    prayed_done = await has_prayed_today(guild_id, user_id)
+    begged_done = await has_begged_today(guild_id, user_id)
+    pot_amount  = await get_word_pot_total(guild_id)
 
-    plays = await get_solo_plays_today(gid, uid, today)
-    last_pray, last_beg = await _get_cd(gid, uid)
-
-    left = max(0, 5 - int(plays or 0))
-    prayed = "✅ done today" if last_pray == today else "🟢 ready"
-    begged = "✅ done today" if last_beg == today else "🟢 ready"
-
-    emb = make_panel(
-        title="🗓️ Daily Actions (UK reset)",
+    em = discord.Embed(
+        title="📅 Daily Actions (UK reset)",
+        color=discord.Color.blurple(),
         description=(
             "All daily limits reset at **00:00 UK time** (Europe/London).\n"
-            "Use the **buttons** below."
-        ),
-        fields=[
-            ("Solo Worldles", f"Play up to **5/day**.\nYou have **{left}** left today. Start with **🧩**.", True),
-            ("Pray", f"+5 {EMO_SHEKEL()} once per day.\nStatus: **{prayed}**. Use **🛐**.", True),
-            ("Beg", f"+5 {EMO_STONE()} once per day.\nStatus: **{begged}**. Use **🙇**.", True),
-            ("Extras", "🎰 **Word Pot** (casino) — not a daily, but fun! Use **🎰**.", False),
-        ],
-        icon="🗓️"
+            "Use the buttons below.\n\n"
+            "**Solo Worldles**\n"
+            "Play up to **5/day**.\n"
+            f"You have **{solo_left}** left today.\n"
+            "Start with 🎲.\n\n"
+            "**Pray**\n"
+            "+5 ẅ once per day.\n"
+            f"Status: {'✅ done today.' if prayed_done else '❌ not done yet.'}\n"
+            "Use: 🙏\n\n"
+            "**Beg**\n"
+            "+5 🧱 stones once per day.\n"
+            f"Status: {'✅ done today.' if begged_done else '❌ not done yet.'}\n"
+            "Use: 🤲\n\n"
+            "**Extras**\n"
+            "💰 **Word Pot** — not a daily, but fun!\n"
+            f"Current pot: {EMO_SHEKEL()} **{pot_amount}** available to win.\n"
+            "Use the 💰 Word Pot button below."
+        )
     )
-    emb.set_footer(text=f"Status shown for: {user.display_name}")
-    return emb
+    em.set_footer(text=f"Status shown for user ID {user_id}")
+    return em
 
 
+
+
+
+
+# --- DailiesView (drop-in replacement) ---
+import weakref
+from collections import defaultdict
+from typing import Optional
 
 class DailiesView(discord.ui.View):
-    def __init__(self, guild_id: int, *, timeout: float = 300):
+    """
+    Dailies panel buttons.
+
+    - Word Pot button shows: 'Word Pot (X shekels)' with a 💰 icon.
+    - The panel can be refreshed from *outside* (e.g., when the pot changes)
+      via: await DailiesView.refresh_pot_label_for_guild(guild_id)
+    """
+
+    # registry of active views by guild (weak refs so they clean up automatically)
+    _registry: dict[int, "weakref.WeakSet[DailiesView]"] = defaultdict(weakref.WeakSet)
+
+    def __init__(self, interaction: discord.Interaction, *, pot_amount: int, timeout: float = 300):
         super().__init__(timeout=timeout)
-        self.guild_id = guild_id
+        self.owner_id = interaction.user.id
+        self.guild_id: Optional[int] = interaction.guild.id if interaction.guild else None
+        self.message: Optional[discord.Message] = None  # set right after /dailies send
+        self.btn_pot: Optional[discord.ui.Button] = None
 
-    async def _ensure_worldler(self, inter: discord.Interaction) -> bool:
-        if not inter.guild:
-            await inter.response.send_message("Server only.", ephemeral=True)
-            return False
-        if not await is_worldler(inter.guild, inter.user):
-            # This one can stay ephemeral since it's an access warning
-            await inter.response.send_message(
-                f"You need the **{WORLDLER_ROLE_NAME}** role. Use `/immigrate` to join.",
-                ephemeral=True
-            )
-            return False
-        return True
+        # --- Start Solo ---
+        btn_start = discord.ui.Button(
+            label="Start Solo (w)",
+            emoji="🎲",
+            style=discord.ButtonStyle.primary,
+        )
 
-    async def _refresh_panel(self, inter: discord.Interaction):
-        """Rebuild & edit the /dailies message after an action."""
+        async def _start_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild or not i.channel:
+                return
+            ch = await solo_start(i.channel, i.user)
+            if isinstance(ch, discord.TextChannel):
+                await send_boxed(i, "Solo Room Opened", f"{i.user.mention} your room is {ch.mention}.", icon="🧩", ephemeral=False)
+            await self._refresh_panel(i)
+
+        btn_start.callback = _start_cb
+        self.add_item(btn_start)
+
+        # --- Pray (+5) ---
+        btn_pray = discord.ui.Button(
+            label="Pray (+5)",
+            emoji="🙏",
+            style=discord.ButtonStyle.success,
+        )
+
+        async def _pray_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild:
+                return
+            gid, uid, cid = i.guild.id, i.user.id, getattr(i.channel, "id", None)
+            today = uk_today_str()
+            last_pray, _ = await _get_cd(gid, uid)
+            if last_pray == today:
+                await send_boxed(i, "Daily — Pray", "You already prayed today. Resets at **00:00 UK time**.", icon="🛐", ephemeral=True)
+            else:
+                await change_balance(gid, uid, 5, announce_channel_id=cid)
+                await _set_cd(gid, uid, "last_pray", today)
+                bal = await get_balance(gid, uid)
+                await send_boxed(i, "Daily — Pray", f"+5 {EMO_SHEKEL()}  · Balance **{bal}**", icon="🛐", ephemeral=False)
+            await self._refresh_panel(i)
+
+        btn_pray.callback = _pray_cb
+        self.add_item(btn_pray)
+
+        # --- Beg (+5 stones) ---
+        btn_beg = discord.ui.Button(
+            label="Beg (+5 stones)",
+            emoji="🤲",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        async def _beg_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild:
+                return
+            gid, uid = i.guild.id, i.user.id
+            today = uk_today_str()
+            _, last_beg = await _get_cd(gid, uid)
+            if last_beg == today:
+                await send_boxed(i, "Daily — Beg", "You already begged today. Resets at **00:00 UK time**.", icon="🙇", ephemeral=True)
+            else:
+                await change_stones(gid, uid, 5)
+                await _set_cd(gid, uid, "last_beg", today)
+                stones = await get_stones(gid, uid)
+                await send_boxed(i, "Daily — Beg", f"{EMO_STONE()} +5 Stones. You now have **{stones}**.", icon="🙇", ephemeral=False)
+            await self._refresh_panel(i)
+
+        btn_beg.callback = _beg_cb
+        self.add_item(btn_beg)
+
+        # --- Word Pot (label: 'Word Pot (X shekels)') ---
+        btn_pot = discord.ui.Button(
+            label=f"Word Pot ({pot_amount} shekels)",
+            emoji="💰",
+            style=discord.ButtonStyle.secondary,
+        )
+
+        async def _pot_cb(i: discord.Interaction):
+            if i.user.id != self.owner_id:
+                return await i.response.send_message("Open your own dailies with **/dailies**.", ephemeral=True)
+            if not i.guild or not i.channel:
+                return
+            ch = await casino_start_word_pot(i.channel, i.user)
+            if isinstance(ch, discord.TextChannel):
+                await send_boxed(i, "Word Pot", f"{i.user.mention} Word Pot room: {ch.mention}", icon="💰", ephemeral=False)
+            # initial refresh right after starting
+            await self._refresh_panel(i)
+
+        btn_pot.callback = _pot_cb
+        self.add_item(btn_pot)
+        self.btn_pot = btn_pot
+
+    # called by /dailies after sending the message
+    def attach_message(self, msg: discord.Message) -> None:
+        self.message = msg
+        if self.guild_id is not None:
+            DailiesView._registry[self.guild_id].add(self)
+
+    async def _refresh_panel(self, i: discord.Interaction):
+        """Refresh the dailies embed + Word Pot button label from inside an interaction."""
         try:
-            emb = await _build_dailies_embed(inter.guild, inter.user)
-            # inter.message is the panel message that contained the button
-            if inter.message:
-                await inter.message.edit(embed=emb, view=self)
-        except Exception as e:
-            log.warning(f"[dailies] refresh failed: {e}")
+            if not i.guild:
+                return
+            latest = await get_word_pot_total(i.guild.id)
+            if self.btn_pot:
+                self.btn_pot.label = f"Word Pot ({latest} shekels)"
+            emb = await _build_dailies_embed(i.guild.id, self.owner_id)
 
-    @discord.ui.button(label="Start Solo (w)", style=discord.ButtonStyle.primary, emoji="🧩")
-    async def btn_solo(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
-            return
-        await inter.response.defer(thinking=False)  # public
-        ch = await solo_start(inter.channel, inter.user)
-        if isinstance(ch, discord.TextChannel):
-            await send_boxed(
-                inter,
-                "Solo Room Opened",
-                f"{inter.user.mention} your room is {ch.mention}.",
-                icon="🧩",
-            )
-        else:
-            await send_boxed(inter, "Solo", "Couldn't start a solo right now.", icon="🧩")
-        await self._refresh_panel(inter)
+            target_msg = self.message or (await i.original_response() if i.response.is_done() else None)
+            if target_msg:
+                await target_msg.edit(embed=emb, view=self)
+            else:
+                await i.edit_original_response(embed=emb, view=self)
+        except Exception:
+            pass  # never blow up the UX
 
-    @discord.ui.button(label="Pray (+5)", style=discord.ButtonStyle.success, emoji="🛐")
-    async def btn_pray(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
+    @classmethod
+    async def refresh_pot_label_for_guild(cls, guild_id: int) -> None:
+        """
+        External refresh: call this AFTER the pot value changes anywhere.
+        It updates the button label *and* the embed for all active dailies in that guild.
+        """
+        views = list(cls._registry.get(guild_id, ()))  # snapshot
+        if not views:
             return
-        gid, uid, cid = inter.guild.id, inter.user.id, inter.channel.id
-        today = uk_today_str()
-        last_pray, _ = await _get_cd(gid, uid)
-        if last_pray == today:
-            await send_boxed(inter, "Daily — Pray", "You already prayed today. Resets at **00:00 UK time**.", icon="🛐")
-        else:
-            await change_balance(gid, uid, 5, announce_channel_id=cid)
-            await _set_cd(gid, uid, "last_pray", today)
-            bal = await get_balance(gid, uid)
-            await send_boxed(inter, "Daily — Pray", f"+5 {EMO_SHEKEL()}  · Balance **{bal}**", icon="🛐")
-        await self._refresh_panel(inter)
 
-    @discord.ui.button(label="Beg (+5 stones)", style=discord.ButtonStyle.secondary, emoji="🙇")
-    async def btn_beg(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
-            return
-        gid, uid = inter.guild.id, inter.user.id
-        today = uk_today_str()
-        _, last_beg = await _get_cd(gid, uid)
-        if last_beg == today:
-            await send_boxed(inter, "Daily — Beg", "You already begged today. Resets at **00:00 UK time**.", icon="🙇")
-        else:
-            await change_stones(gid, uid, 5)
-            await _set_cd(gid, uid, "last_beg", today)
-            stones = await get_stones(gid, uid)
-            await send_boxed(inter, "Daily — Beg", f"{EMO_STONE()} +5 Stones. You now have **{stones}**.", icon="🙇")
-        await self._refresh_panel(inter)
+        latest = await get_word_pot_total(guild_id)
+        to_prune = []
+        for view in views:
+            try:
+                if view.btn_pot:
+                    view.btn_pot.label = f"Word Pot ({latest} shekels)"
+                emb = await _build_dailies_embed(guild_id, view.owner_id)
+                if view.message:
+                    await view.message.edit(embed=emb, view=view)
+                else:
+                    # no message yet (race) — skip, we'll catch it on next call
+                    pass
+            except Exception:
+                to_prune.append(view)
+        # prune broken/dead views
+        for v in to_prune:
+            try:
+                cls._registry[guild_id].discard(v)
+            except Exception:
+                pass
 
-    @discord.ui.button(label="Word Pot", style=discord.ButtonStyle.secondary, emoji="🎰")
-    async def btn_wordpot(self, inter: discord.Interaction, button: discord.ui.Button):
-        if not await self._ensure_worldler(inter): 
-            return
-        await inter.response.defer(thinking=False)  # public
-        ch = await casino_start_word_pot(inter.channel, inter.user)
-        if isinstance(ch, discord.TextChannel):
-            await send_boxed(inter, "Word Pot Room Opened", f"{inter.user.mention} your room is {ch.mention}.", icon="🎰")
-        else:
-            await send_boxed(inter, "Word Pot", "Couldn't start Word Pot.", icon="🎰")
-        await self._refresh_panel(inter)
+    async def on_timeout(self) -> None:
+        for c in self.children:
+            c.disabled = True
+        try:
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
+        # unregister on timeout
+        try:
+            if self.guild_id is not None:
+                self._registry[self.guild_id].discard(self)
+        except Exception:
+            pass
+
+
+
+
+
 
 
 
@@ -2041,7 +3106,7 @@ async def dailies_raw_reaction_add(payload: discord.RawReactionActionEvent):
         # 🔄 Refresh the panel embed (leave existing buttons/view intact)
         try:
             msg = await channel.fetch_message(payload.message_id)
-            new_emb = await _build_dailies_embed(guild, member)
+            new_emb = await _build_dailies_embed(guild.id, member.id)
             await msg.edit(embed=new_emb)
         except Exception:
             pass
@@ -2052,30 +3117,25 @@ async def dailies_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
       
 
-@tree.command(name="dailies", description="See and click your daily actions (UK reset).")
-async def dailies_cmd(inter: discord.Interaction):
-    if not inter.guild:
-        return await inter.response.send_message("Run this in a server.", ephemeral=True)
-    if not await guard_worldler_inter(inter):
-        return
+@tree.command(name="dailies", description="Show your daily actions.")
+async def dailies(interaction: discord.Interaction):
+    emb = await _build_dailies_embed(interaction.guild.id, interaction.user.id)
+    pot_amount = await get_word_pot_total(interaction.guild.id)
 
-    emb = await _build_dailies_embed(inter.guild, inter.user)
-    view = DailiesView(inter.guild.id)
+    view = DailiesView(interaction, pot_amount=pot_amount)
+    await interaction.response.send_message(embed=emb, view=view)
 
-    # Send panel publicly (not ephemeral)
-    await inter.response.send_message(embed=emb, view=view)
-
-    # (Optional) keep the reaction shortcuts you already had
     try:
-        msg = await inter.original_response()
-        dailies_msg_ids.add(msg.id)
-        for emo in ("🧩", "🛐", "🙇", "🎰"):
-            try:
-                await msg.add_reaction(emo)
-            except Exception:
-                pass
+        msg = await interaction.original_response()
+        view.attach_message(msg)
+        dailies_msg_ids.add(msg.id)  # 👈 add this
     except Exception:
         pass
+
+
+
+
+
 
 
 
@@ -2098,6 +3158,14 @@ def _bounty_emoji_matches(emoji: discord.PartialEmoji) -> bool:
     if emoji.is_unicode_emoji():
         return emoji.name == "🎯"
     return (emoji.name or "").lower() == target_name
+  
+
+def _pend_requirements(pend: dict) -> tuple[int, int]:
+    """Return (needed_players, arm_delay_s) for pending bounty or royale."""
+    if pend.get("mode") == "royale":
+        return ROYALE_MIN_PLAYERS, ROYALE_ARM_DELAY_S
+    return 2, BOUNTY_ARM_DELAY_S
+  
 
 async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel, hour_idx: int):
     if guild.id in pending_bounties or guild.id in bounty_games:
@@ -2109,14 +3177,26 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
     rid = await ensure_bounty_role(guild)
     em = EMO_BOUNTY()
     role_mention = "" if suppress_ping else (f"<@&{rid}>" if rid else "")
+    bonus = int(cfg.get("next_bounty_bonus", 0))
+    prize = BOUNTY_PAYOUT + bonus
+    mode = "royale" if prize >= 20 else "bounty"
 
-    desc = (
-      f"React with {em} to **arm** this bounty — need **2** players.\n"
-      f"**After 2 react, the bounty arms in {BOUNTY_ARM_DELAY_S//60} minute.**\n"
-      f"**Prize:** {BOUNTY_PAYOUT} {EMO_SHEKEL()}\n"
-      "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
-      f"⏲️ *This prompt expires in {BOUNTY_EXPIRE_MIN} minutes.*"
-  )
+    if mode == "royale":
+        desc = (
+            f"React with {em} to **join Worldle Royale** — need **{ROYALE_MIN_PLAYERS}** players.\n"
+            f"After {ROYALE_MIN_PLAYERS} react, the royale **starts in {ROYALE_ARM_DELAY_S//60} minutes**.\n"
+            f"**Prize pool:** {prize} {EMO_SHEKEL()}\n"
+            "Use `bg APPLE` or `/worldle_bounty_guess` when started.\n\n"
+            f"⏲️ *This prompt expires in {BOUNTY_EXPIRE_MIN} minutes.*"
+        )
+    else:
+        desc = (
+            f"React with {em} to **arm** this bounty — need **2** players.\n"
+            f"**After 2 react, the bounty arms in {BOUNTY_ARM_DELAY_S//60} minute.**\n"
+            f"**Prize:** {prize} {EMO_SHEKEL()}\n"
+            "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+            f"⏲️ *This prompt expires in {BOUNTY_EXPIRE_MIN} minutes.*"
+        )
 
     emb = make_panel(title=f"{em} Hourly Bounty (GMT)", description=desc)
 
@@ -2140,6 +3220,8 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
         "users": set(),
         "hour_idx": hour_idx,
         "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
+        "mode": mode,
+        "payout": prize,
     }
     await set_cfg(guild.id, last_bounty_hour=hour_idx)
     return True
@@ -2149,27 +3231,52 @@ async def _post_bounty_prompt(guild: discord.Guild, channel: discord.TextChannel
 
 
 
-async def _start_bounty_after_gate(guild: discord.Guild, channel_id: int):
+async def _start_bounty_after_gate(guild: discord.Guild, pend: dict):
     if guild.id in bounty_games:
         return
-    answer = random.choice(ANSWERS)
-    bounty_games[guild.id] = {
-        "answer": answer,
-        "channel_id": channel_id,
-        "started_at": gmt_now_s(),
-        "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
-    }
-    await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0)  # re-enable pings
-    ch = guild.get_channel(channel_id)
-    if isinstance(ch, discord.TextChannel):
-        emb = make_panel(
-            title="🎯 Bounty armed!",
-            description=(
-                f"First to solve in **{BOUNTY_EXPIRE_MIN} minutes** wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**.\n"
-                "Use `bg WORD` or `/worldle_bounty_guess`."
-            ),
-        )
-        await safe_send(ch, embed=emb)
+    channel_id = pend["channel_id"]
+    mode = pend.get("mode", "bounty")
+    payout = pend.get("payout", BOUNTY_PAYOUT)
+    if mode == "royale":
+        bounty_games[guild.id] = {
+            "mode": "royale",
+            "answer": random.choice(ANSWERS),
+            "channel_id": channel_id,
+            "started_at": gmt_now_s(),
+            "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
+            "participants": set(pend.get("users", set())),
+            "payout": payout,
+        }
+        await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0, next_bounty_bonus=0)
+        ch = guild.get_channel(channel_id)
+        if isinstance(ch, discord.TextChannel):
+            emb = make_panel(
+                title="👑 Worldle Royale!",
+                description=(
+                    f"{len(pend.get('users', set()))} players entered. Solve to be safe; one random player will be eliminated each round.\n"
+                    f"Last standing wins **{payout} {EMO_SHEKEL()}**."
+                ),
+            )
+            await safe_send(ch, embed=emb)
+    else:
+        bounty_games[guild.id] = {
+            "answer": random.choice(ANSWERS),
+            "channel_id": channel_id,
+            "started_at": gmt_now_s(),
+            "expires_at": gmt_now_s() + BOUNTY_EXPIRE_S,
+            "payout": payout,
+        }
+        await set_cfg(guild.id, last_bounty_ts=gmt_now_s(), suppress_bounty_ping=0, next_bounty_bonus=0)
+        ch = guild.get_channel(channel_id)
+        if isinstance(ch, discord.TextChannel):
+            emb = make_panel(
+                title="🎯 Bounty armed!",
+                description=(
+                    f"First to solve in **{BOUNTY_EXPIRE_MIN} minutes** wins **{payout} {EMO_SHEKEL()}**.\n"
+                    "Use `bg WORD` or `/worldle_bounty_guess`."
+                ),
+            )
+            await safe_send(ch, embed=emb)
 
 
 
@@ -2212,6 +3319,11 @@ async def worldle_bounty_guess(inter: discord.Interaction, word: str):
         ch = inter.guild.get_channel(game["channel_id"])
         return await inter.response.send_message(f"Use this in {ch.mention if ch else 'the bounty channel'}.", ephemeral=True)
 
+    mode = game.get("mode", "bounty")
+    if mode == "royale" and inter.user.id not in game.get("participants", set()):
+        return await inter.response.send_message("You're not part of this Worldle Royale.", ephemeral=True)
+      
+
     # NEW: per-user cooldown
     now_s = gmt_now_s()
     key = (inter.guild.id, inter.user.id)
@@ -2240,34 +3352,70 @@ async def worldle_bounty_guess(inter: discord.Interaction, word: str):
 
     if cleaned == game["answer"]:
         gid, uid = inter.guild.id, inter.user.id
-        await change_balance(gid, uid, BOUNTY_PAYOUT, announce_channel_id=game["channel_id"])
-        await inc_stat(gid, uid, "bounties_won", 1)
-        bal = await get_balance(gid, uid)
-
-        # capture & clear
-        ans_raw = game["answer"]
-        ans_up = ans_raw.upper()
-        del bounty_games[gid]
-
-        # small confirmation in-channel
-        await inter.followup.send(
-            f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}**! (Balance: {bal})"
-        )
-
-        # definition + neat card in announcements
-        definition = await fetch_definition(ans_raw)
-        fields = []
-        if definition:
-            fields.append(("Definition", definition, False))
-        fields.append(("Result", row, False))  # emojis render
-
-        emb = make_card(
-            title="🎯 Hourly Bounty — Solved",
-            description=f"{inter.user.mention} wins **{BOUNTY_PAYOUT} {EMO_SHEKEL()}** by solving **{ans_up}**.",
-            fields=fields,
-            color=CARD_COLOR_SUCCESS,
-        )
-        await _announce_result(inter.guild, origin_cid=None, content="", embed=emb)
+        if mode == "royale":
+            participants = game.get("participants", set())
+            solver = uid
+            others = [p for p in participants if p != solver]
+            eliminated = random.choice(others) if others else None
+            if eliminated:
+                participants.discard(eliminated)
+            elim_txt = f" ❌ <@{eliminated}> eliminated." if eliminated else ""
+            await inter.followup.send(f"✅ {inter.user.mention} is safe!{elim_txt}")
+            if len(participants) <= 1:
+                winner_id = next(iter(participants))
+                payout = game.get("payout", BOUNTY_PAYOUT)
+                await change_balance(gid, winner_id, payout, announce_channel_id=game["channel_id"])
+                await inc_stat(gid, winner_id, "bounties_won", 1)
+                bal = await get_balance(gid, winner_id)
+                ans_raw = game["answer"]
+                ans_up = ans_raw.upper()
+                del bounty_games[gid]
+                winner_member = inter.guild.get_member(winner_id)
+                winner_mention = winner_member.mention if winner_member else f"<@{winner_id}>"
+                await inter.followup.send(
+                    f"🏆 {winner_mention} wins Worldle Royale and earns **{payout} {EMO_SHEKEL()}**! (Balance: {bal})"
+                )
+                definition = await fetch_definition(ans_raw)
+                fields = []
+                if definition:
+                    fields.append(("Definition", definition, False))
+                fields.append(("Result", row, False))
+                emb = make_card(
+                    title="👑 Worldle Royale — Winner",
+                    description=f"{winner_mention} survives and wins **{payout} {EMO_SHEKEL()}** by solving **{ans_up}**.",
+                    fields=fields,
+                    color=CARD_COLOR_SUCCESS,
+                )
+                await _announce_result(inter.guild, origin_cid=None, content="", embed=emb)
+                await set_cfg(inter.guild.id, next_bounty_bonus=0)
+            else:
+                game["answer"] = random.choice(ANSWERS)
+                game["started_at"] = gmt_now_s()
+                game["expires_at"] = gmt_now_s() + BOUNTY_EXPIRE_S
+                await inter.followup.send(f"Next word! {len(participants)} players remain.")
+        else:
+            payout = game.get("payout", BOUNTY_PAYOUT)
+            await change_balance(gid, uid, payout, announce_channel_id=game["channel_id"])
+            await inc_stat(gid, uid, "bounties_won", 1)
+            bal = await get_balance(gid, uid)
+            ans_raw = game["answer"]
+            ans_up = ans_raw.upper()
+            del bounty_games[gid]
+            await inter.followup.send(
+                f"🏆 {inter.user.mention} solved the Bounty Wordle (**{ans_up}**) and wins **{payout} {EMO_SHEKEL()}**! (Balance: {bal})"
+            )
+            definition = await fetch_definition(ans_raw)
+            fields = []
+            if definition:
+                fields.append(("Definition", definition, False))
+            fields.append(("Result", row, False))
+            emb = make_card(
+                title="🎯 Hourly Bounty — Solved",
+                description=f"{inter.user.mention} wins **{payout} {EMO_SHEKEL()}** by solving **{ans_up}**.",
+                fields=fields,
+                color=CARD_COLOR_SUCCESS,
+            )
+            await _announce_result(inter.guild, origin_cid=None, content="", embed=emb)
     else:
         await inter.followup.send("(Keep trying! Unlimited guesses.)")
 
@@ -2292,21 +3440,21 @@ async def bounty_loop():
                     continue
                 ch = guild.get_channel(pend["channel_id"])
 
-                # Suppress next-hour bounty ping
                 try:
                     await set_cfg(guild.id, suppress_bounty_ping=1)
                 except Exception:
                     pass
 
-                # +1 to Word Pot
-                pot = await get_casino_pot(gid)
-                new_pot = pot + 1
-                await set_casino_pot(gid, new_pot)
+
+                cfg = await get_cfg(guild.id)
+                bonus = int(cfg.get("next_bounty_bonus", 0)) + 1
+                await set_cfg(guild.id, next_bounty_bonus=bonus)
 
                 if isinstance(ch, discord.TextChannel):
+                    title = "⏲️ Worldle Royale prompt expired" if pend.get("mode") == "royale" else "⏲️ Bounty prompt expired"
                     emb = make_panel(
-                        title="⏲️ Bounty prompt expired",
-                        description=f"+1 {EMO_SHEKEL()} to **Word Pot** (now **{new_pot}**).",
+                        title=title,
+                        description=f"+1 {EMO_SHEKEL()} to next bounty (now **{BOUNTY_PAYOUT + bonus}**).",
                     )
                     try:
                         msg = await ch.fetch_message(pend["message_id"])
@@ -2320,7 +3468,8 @@ async def bounty_loop():
     for gid, pend in list(pending_bounties.items()):
         try:
             arm_at = pend.get("arming_at")
-            if arm_at and now >= arm_at and len(pend.get("users", set())) >= 2:
+            need, _delay = _pend_requirements(pend)
+            if arm_at and now >= arm_at and len(pend.get("users", set())) >= need:
                 guild = discord.utils.get(bot.guilds, id=gid)
                 if not guild:
                     continue
@@ -2332,9 +3481,7 @@ async def bounty_loop():
                     except Exception:
                         await safe_send(ch, "🔔 **Arming now!**")
 
-                channel_id = pend["channel_id"]
-                pending_bounties.pop(gid, None)
-                await _start_bounty_after_gate(guild, channel_id)
+                await _start_bounty_after_gate(guild, pend)
         except Exception as e:
             log.warning(f"bounty_loop arming error (guild {gid}): {e}")
 
@@ -2354,17 +3501,17 @@ async def bounty_loop():
                 except Exception:
                     pass
 
-                # +1 to Word Pot
-                pot = await get_casino_pot(gid)
-                new_pot = pot + 1
-                await set_casino_pot(gid, new_pot)
+                # +1 to next bounty
+                cfg = await get_cfg(guild.id)
+                bonus = int(cfg.get("next_bounty_bonus", 0)) + 1
+                await set_cfg(guild.id, next_bounty_bonus=bonus)
 
                 if isinstance(ch, discord.TextChannel):
                     emb = make_panel(
                         title="⏲️ Bounty expired",
                         description=(
                             f"No solve in **{BOUNTY_EXPIRE_MIN} minutes**.\n"
-                            f"+1 {EMO_SHEKEL()} to **Word Pot** (now **{new_pot}**)."
+                            f"+1 {EMO_SHEKEL()} to next bounty (now **{BOUNTY_PAYOUT + bonus}**)."
                         ),
                     )
                     await safe_send(ch, embed=emb)
@@ -2407,14 +3554,14 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not guild:
         return
 
-    # --- DAILIES PANEL HOOK (safe early exit if not a /dailies message) ---
+    # --- DAILIES PANEL HOOK (keep) ---
     try:
         await dailies_raw_reaction_add(payload)
     except Exception as e:
         log.warning(f"[dailies] reaction proxy error: {e}")
-    # ----------------------------------------------------------------------
+    # ---------------------------------
 
-    # ---------- BOUNTY (existing gate) ----------
+    # ---------- BOUNTY: gate (boxed + edits) ----------
     pend = pending_bounties.get(gid)
     if pend and payload.message_id == pend["message_id"] and _bounty_emoji_matches(payload.emoji):
         try:
@@ -2423,24 +3570,67 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             member = None
         if member and not member.bot and await is_worldler(guild, member):
             pend["users"].add(member.id)
-            if len(pend["users"]) >= 2:
-                channel_id = pend["channel_id"]
-                ch = guild.get_channel(channel_id)
+
+            # Build a neat player list
+            names = []
+            for uid in sorted(pend["users"]):
                 try:
-                    if isinstance(ch, discord.TextChannel):
-                        msg = await ch.fetch_message(pend["message_id"])
-                        names = []
-                        for uid in list(pend["users"])[:2]:
-                            m = guild.get_member(uid) or await guild.fetch_member(uid)
-                            names.append(m.mention if m else f"<@{uid}>")
-                        await msg.reply(f"✅ Bounty armed by {', '.join(names)}. Good luck!")
+                    m = guild.get_member(uid) or await guild.fetch_member(uid)
+                    names.append(m.mention if m else f"<@{uid}>")
+                except Exception:
+                    names.append(f"<@{uid}>")
+            players_txt = ", ".join(names) if names else "—"
+
+            # Edit the original gate card to show who’s in
+            try:
+                ch = guild.get_channel(pend["channel_id"])
+                if isinstance(ch, discord.TextChannel):
+                    msg = await ch.fetch_message(pend["message_id"])
+                    prize = pend.get("payout", BOUNTY_PAYOUT)
+                    if pend.get("mode") == "royale":
+                        desc = (
+                            f"React with {EMO_BOUNTY()} to **join Worldle Royale** — need **{ROYALE_MIN_PLAYERS}** players.\n"
+                            f"After {ROYALE_MIN_PLAYERS} react, the royale **starts in {ROYALE_ARM_DELAY_S//60} minutes**.\n"
+                            f"**Prize pool:** {prize} {EMO_SHEKEL()}\n"
+                            "Use `bg APPLE` or `/worldle_bounty_guess` when started.\n\n"
+                            f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                        )
+                        title = f"{EMO_BOUNTY()} Worldle Royale"
+                    else:
+                        desc = (
+                            f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
+                            f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
+                            f"**Prize:** {prize} {EMO_SHEKEL()}\n"
+                            "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+                            f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                        )
+                        title = f"{EMO_BOUNTY()} Hourly Bounty (GMT)"
+                    emb = make_panel(
+                        title=title,
+                        description=desc,
+                        fields=[("Players ready", players_txt, False)],
+                    )
+                    await msg.edit(embed=emb)
+            except Exception:
+                pass
+
+            need, delay = _pend_requirements(pend)
+            if len(pend["users"]) >= need and not pend.get("arming_at"):
+                pend["arming_at"] = gmt_now_s() + delay
+                try:
+                    ch = guild.get_channel(pend["channel_id"])
+                    title = "Bounty" if pend.get("mode") != "royale" else "Royale"
+                    msg_txt = (
+                        f"✅ Armed by {', '.join(names[:need])}. **Arming in {delay//60} minute…**"
+                        if pend.get("mode") != "royale"
+                        else f"✅ Armed by {', '.join(names[:need])}. **Starting in {delay//60} minutes…**"
+                    )
+                    await send_boxed(ch, title, msg_txt, icon="🎯")
                 except Exception:
                     pass
-                pending_bounties.pop(gid, None)
-                await _start_bounty_after_gate(guild, channel_id)
         return
 
-    # ---------- DUNGEON: join gate ----------
+    # ---------- DUNGEON: join gate (boxed + edits only) ----------
     gate = pending_dungeon_gates_by_msg.get(payload.message_id)
     if gate and _dungeon_join_emoji_matches(payload.emoji):
         try:
@@ -2448,16 +3638,24 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         except Exception:
             member = None
         if member and (not member.bot) and await is_worldler(guild, member):
+            # Track participant
             gate["participants"].add(member.id)
+
+            # Grant write access to the dungeon channel
             dch = guild.get_channel(gate["dungeon_channel_id"])
             if isinstance(dch, discord.TextChannel):
                 try:
                     await dch.set_permissions(member, view_channel=True, send_messages=True, read_message_history=True)
-                    g = dungeon_games.get(dch.id)
-                    if g:
-                        g["participants"].add(member.id)
-                    gmsg_id = g.get("welcome_msg_id") if g else None
-                    if gmsg_id:
+                except Exception:
+                    pass
+                # Mirror into the dungeon game object
+                g = dungeon_games.get(dch.id)
+                if g:
+                    g["participants"].add(member.id)
+                gmsg_id = g.get("welcome_msg_id") if g else None
+                if gmsg_id:
+                    # Edit the in-room welcome to show all participants (no new lines)
+                    try:
                         msg = await dch.fetch_message(gmsg_id)
                         names = []
                         for uid in sorted(g["participants"]):
@@ -2466,15 +3664,37 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                                 names.append(mm.mention if mm else f"<@{uid}>")
                             except Exception:
                                 names.append(f"<@{uid}>")
-                        await msg.edit(content="🌀 **Dungeon — Tier {}**\nParticipants: {}\n\nWhen ready, the **owner** clicks 🔒 to start."
-                                       .format(g["tier"], ", ".join(names)))
-                except Exception:
-                    pass
+                        await msg.edit(content=(
+                            f"🌀 **Dungeon — Tier {g['tier']}**\n"
+                            f"Participants: {', '.join(names)}\n\n"
+                            "When ready, the **owner** clicks 🔒 to start."
+                        ))
+                    except Exception:
+                        pass
+
+            # Edit the original *gate* message (where players click) to include the live roster
             try:
                 gate_ch = guild.get_channel(gate["gate_channel_id"])
                 if isinstance(gate_ch, discord.TextChannel):
-                    m = guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
-                    await gate_ch.send(f"{EMO_DUNGEON()} {m.mention} **joined the dungeon**.", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+                    jmsg = await gate_ch.fetch_message(payload.message_id)
+                    names = []
+                    for uid in sorted(gate["participants"]):
+                        try:
+                            mm = guild.get_member(uid) or await guild.fetch_member(uid)
+                            names.append(mm.mention if mm else f"<@{uid}>")
+                        except Exception:
+                            names.append(f"<@{uid}>")
+                    emb = make_panel(
+                        title=f"{EMO_DUNGEON()} Dungeon Gate — Tier {gate['tier']}",
+                        description=(
+                            "Click the swirl below to **join**. "
+                            "When everyone’s in, the **owner** will lock the dungeon from inside to begin."
+                        ),
+                        fields=[("Participants", ", ".join(names) if names else "—", False)],
+                        icon="🌀",
+                    )
+                    # Switch to an embed (boxed); keep the reaction on the same message
+                    await jmsg.edit(content=None, embed=emb)
             except Exception:
                 pass
         return
@@ -2489,9 +3709,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 pending_dungeon_gates_by_msg.pop(mid, None)
             ch = guild.get_channel(ch_id)
             if isinstance(ch, discord.TextChannel):
-                # In-room notice
-                await ch.send("🔒 **Gate closed.** No further joins. The dungeon begins!")
-                # NEW: public announcement in the configured announcements channel
+                await send_boxed(ch, "Dungeon", "🔒 **Gate closed.** No further joins. The dungeon begins!", icon="🌀")
+                # public announcement
                 try:
                     await _announce_result(
                         guild,
@@ -2512,7 +3731,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             if _continue_emoji_matches(payload.emoji):
                 game["decision_msg_id"] = None
                 if isinstance(ch, discord.TextChannel):
-                    await ch.send("⏩ **Continuing…**")
+                    await send_boxed(ch, "Dungeon", "⏩ **Continuing…**", icon="🌀")
                 await _dungeon_start_round(game)
                 return
             if _cashout_emoji_matches(payload.emoji):
@@ -2523,17 +3742,33 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 
 
+# -------------------- /dungeon (UI entry) --------------------
+
+@tree.command(name="dungeon", description="Dungeon book: tiers, lore, loot, and Enter button.")
+async def dungeon_ui(inter: discord.Interaction):
+    if not await guard_worldler_inter(inter):
+        return
+    view = DungeonView(inter, start_tier=3)
+    emb = await _build_dungeon_embed(inter.guild.id, inter.user.id, "t3")
+    await inter.response.send_message(embed=emb, view=view)
+    try:
+        view.message = await inter.original_response()
+    except Exception:
+        pass
+    await view.refresh_page()  # <-- set button label/state now
+
+
+
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    """Opt-out: removing the 🎯 reaction before arming removes you from the pending pool."""
+    """Bounty opt-out: update the gate card (boxed) and cancel arming if we fall below 2."""
     gid = payload.guild_id
     if gid is None:
         return
+
     pend = pending_bounties.get(gid)
-    if not pend or payload.message_id != pend.get("message_id"):
-        return
-    if not _bounty_emoji_matches(payload.emoji):
+    if not pend or payload.message_id != pend.get("message_id") or not _bounty_emoji_matches(payload.emoji):
         return
 
     # Remove the user from the pending set (if present)
@@ -2541,62 +3776,65 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if uid and uid in pend.get("users", set()):
         pend["users"].discard(uid)
 
-        # NEW: if countdown was running but we dropped below 2, cancel it
-        if pend.get("arming_at") and len(pend["users"]) < 2:
-            pend["arming_at"] = None
-            try:
-                guild = discord.utils.get(bot.guilds, id=gid)
-                ch = guild.get_channel(pend["channel_id"])
-                if isinstance(ch, discord.TextChannel):
-                    try:
-                        msg = await ch.fetch_message(pend["message_id"])
-                        await msg.reply("⏹️ Bounty arming **cancelled** — need 2 players again.")
-                    except Exception:
-                        await ch.send("⏹️ Bounty arming **cancelled** — need 2 players again.")
-            except Exception:
-                pass
-
-        # Announce opt-out (existing behavior)
         guild = discord.utils.get(bot.guilds, id=gid)
         if not guild:
             return
+
+        # If countdown was running but we dropped below required players, cancel it (boxed)
+        need, _delay = _pend_requirements(pend)
+        if pend.get("arming_at") and len(pend["users"]) < need:
+            pend["arming_at"] = None
+            try:
+                ch = guild.get_channel(pend["channel_id"])
+                title = "Bounty" if pend.get("mode") != "royale" else "Royale"
+                await send_boxed(ch, title, f"⏹️ Arming **cancelled** — need {need} players again.", icon="🎯")
+            except Exception:
+                pass
+
+        # Edit the original gate embed to reflect the new roster
         try:
             ch = guild.get_channel(pend["channel_id"])
             if isinstance(ch, discord.TextChannel):
-                try:
-                    member = guild.get_member(uid) or await guild.fetch_member(uid)
-                    name = member.mention if member else f"<@{uid}>"
-                except Exception:
-                    name = f"<@{uid}>"
-                try:
-                    msg = await ch.fetch_message(pend["message_id"])
-                    await msg.reply(f"🚪 {name} **opted out** of this bounty.")
-                except Exception:
-                    await ch.send(f"🚪 {name} **opted out** of this bounty.")
+                msg = await ch.fetch_message(pend["message_id"])
+                names = []
+                for id_ in sorted(pend["users"]):
+                    try:
+                        m = guild.get_member(id_) or await guild.fetch_member(id_)
+                        names.append(m.mention if m else f"<@{id_}>")
+                    except Exception:
+                        names.append(f"<@{id_}>")
+                players_txt = ", ".join(names) if names else "—"
+                prize = pend.get("payout", BOUNTY_PAYOUT)
+                if pend.get("mode") == "royale":
+                    desc = (
+                        f"React with {EMO_BOUNTY()} to **join Worldle Royale** — need **{ROYALE_MIN_PLAYERS}** players.\n"
+                        f"After {ROYALE_MIN_PLAYERS} react, the royale **starts in {ROYALE_ARM_DELAY_S//60} minutes**.\n"
+                        f"**Prize pool:** {prize} {EMO_SHEKEL()}\n"
+                        "Use `bg APPLE` or `/worldle_bounty_guess` when started.\n\n"
+                        f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                    )
+                    title = f"{EMO_BOUNTY()} Worldle Royale"
+                else:
+                    desc = (
+                        f"React with {EMO_BOUNTY()} to **arm** this bounty — need **2** players.\n"
+                        f"After 2 react, the bounty **arms in {BOUNTY_ARM_DELAY_S//60} minute**.\n"
+                        f"**Prize:** {prize} {EMO_SHEKEL()}\n"
+                        "Use `bg APPLE` or `/worldle_bounty_guess` when armed.\n\n"
+                        f"⏲️ This prompt expires in {BOUNTY_EXPIRE_MIN} minutes."
+                    )
+                    title = f"{EMO_BOUNTY()} Hourly Bounty (GMT)"
+                emb = make_panel(
+                    title=title,
+                    description=desc,
+                    fields=[("Players ready", players_txt, False)],
+                )
+                await msg.edit(embed=emb)
         except Exception:
             pass
 
 
-# -------------------- DUNGEON emojis/helpers --------------------
-EMO_DUNGEON_NAME = os.getenv("WW_DUNGEON_NAME", "ww_dungeon")
 
-def EMO_DUNGEON() -> str:
-    e = discord.utils.find(lambda em: em.name.lower() == EMO_DUNGEON_NAME.lower(), bot.emojis)
-    return str(e) if e else "🌀"  # fallback
 
-def _dungeon_join_emoji_matches(emoji: discord.PartialEmoji) -> bool:
-    if emoji.is_unicode_emoji():
-        return emoji.name == "🌀"
-    return (emoji.name or "").lower() == EMO_DUNGEON_NAME.lower()
-
-def _lock_emoji_matches(emoji: discord.PartialEmoji) -> bool:
-    return emoji.is_unicode_emoji() and emoji.name == "🔒"
-
-def _continue_emoji_matches(emoji: discord.PartialEmoji) -> bool:
-    return emoji.is_unicode_emoji() and emoji.name == "⏩"
-
-def _cashout_emoji_matches(emoji: discord.PartialEmoji) -> bool:
-    return emoji.is_unicode_emoji() and emoji.name == "💰"
 
 
 # -------------------- DUNGEON tickets (T1/T2/T3) --------------------
@@ -2775,7 +4013,7 @@ async def _dungeon_settle_and_close(game: dict, payout_each: int, note: str):
 
 async def _dungeon_start_round(game: dict):
     # keep cumulative list across rounds
-    game.setdefault("solved_rounds", [])  # list[str] of solved ANSWERS (UPPER)
+    game.setdefault("solved_rounds", [])
     game["answer"] = _dungeon_new_answer()
     game["guesses"] = []
     game["legend"] = {}
@@ -2784,12 +4022,15 @@ async def _dungeon_start_round(game: dict):
 
     ch = discord.utils.get(bot.get_all_channels(), id=game["channel_id"])
     if isinstance(ch, discord.TextChannel):
-        await ch.send(
-            f"🗝️ **New Wordle begins!** Tier **{game['tier']}** — you have **{game['max']} tries**.\n"
-            f"Guess with `g APPLE` here."
+        await send_boxed(
+            ch,
+            "Dungeon — New Wordle",
+            f"Tier **{game['tier']}** — you have **{game['max']} tries**.\nGuess with `g APPLE` here.",
+            icon="🌀",
         )
         blank_board = render_board([], total_rows=game["max"])
-        await ch.send(blank_board)
+        await ch.send(blank_board)  # board plain
+
 
 
 
@@ -2799,21 +4040,21 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
     ch_id = channel.id
     game = dungeon_games.get(ch_id)
     if not game or game.get("state") not in ("active",):
-        await safe_send(channel, "No active dungeon round right now.")
+        await send_boxed(channel, "Dungeon", "No active dungeon round right now.", icon="🌀")
         return
     if author.id not in game["participants"]:
-        await safe_send(channel, f"{author.mention} you're not registered for this dungeon.", allowed_mentions=discord.AllowedMentions.none())
+        await send_boxed(channel, "Dungeon", f"{author.mention} you're not registered for this dungeon.", icon="🌀")
         return
 
     cleaned = "".join(ch for ch in word.lower().strip() if ch.isalpha())
     if len(cleaned) != 5:
-        await safe_send(channel, "Guess must be **exactly 5 letters**.")
+        await send_boxed(channel, "Invalid Guess", "Guess must be **exactly 5 letters**.", icon="❗")
         return
     if not is_valid_guess(cleaned):
-        await safe_send(channel, "That’s not in the Wordle dictionary (UK variants supported).")
+        await send_boxed(channel, "Invalid Guess", "That’s not in the Wordle dictionary (UK variants supported).", icon="📚")
         return
     if len(game["guesses"]) >= game["max"]:
-        await safe_send(channel, "Out of tries for this round.")
+        await send_boxed(channel, "Dungeon", "Out of tries for this round.", icon="🌀")
         return
 
     colors = score_guess(cleaned, game["answer"])
@@ -2821,7 +4062,7 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
     update_legend(game["legend"], cleaned, colors)
 
     board = render_board(game["guesses"], total_rows=game["max"])
-    await safe_send(channel, board)
+    await safe_send(channel, board)  # board plain
 
     attempt = len(game["guesses"])
     if cleaned == game["answer"]:
@@ -2835,7 +4076,7 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
         except Exception:
             pass
 
-        # Loot: 40% stone, 10% ticket down-tier (T3->T2, T2->T1)
+        # Loot: chances remain the same
         loot_msgs = []
         if random.random() < 0.40:
             await change_stones(game["guild_id"], author.id, 1)
@@ -2849,11 +4090,15 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
 
         legend = legend_overview(game["legend"])
         extra = f" 🎁 Loot: {' · '.join(loot_msgs)}" if loot_msgs else ""
-        await safe_send(channel,
-            f"✅ **Solved on attempt {attempt}!** Added **+{gained} {EMO_SHEKEL()}** to the dungeon pool "
-            f"(now **{game['pool']}**).{extra}\n"
-            f"{legend}\n\n"
-            f"**Owner**: react **⏩** to **Continue** or **💰** to **Cash Out** for everyone."
+        fields = [("Pool", f"Added **+{gained} {EMO_SHEKEL()}** (now **{game['pool']}**).", True)]
+        if legend:
+            fields.append(("Legend", legend, False))
+        await send_boxed(
+            channel,
+            f"✅ Solved on attempt {attempt}!",
+            f"**Owner**: react **⏩** to **Continue** or **💰** to **Cash Out** for everyone.{extra}",
+            icon="🌀",
+            fields=fields,
         )
         msg = await safe_send(channel, "⏩ Continue or 💰 Cash Out?")
         try:
@@ -2874,9 +4119,11 @@ async def dungeon_guess(channel: discord.TextChannel, author: discord.Member, wo
     next_attempt = attempt + 1
     payout = payout_for_attempt(next_attempt) * _dungeon_mult_for_tier(game["tier"])
     hint = legend_overview(game["legend"])
-    txt = f"Attempt **{attempt}/{game['max']}** — Solve on attempt **{next_attempt}** to add **+{payout}** to the pool."
-    if hint: txt += f"\n{hint}"
-    await safe_send(channel, txt)
+    flds = [("Next", f"Attempt **{attempt}/{game['max']}** — Solve on attempt **{next_attempt}** to add **+{payout}** to the pool.", False)]
+    if hint:
+        flds.append(("Legend", hint, False))
+    await send_boxed(channel, "Dungeon — Status", "", icon="🌀", fields=flds)
+
 
 
 
@@ -2925,7 +4172,7 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         else:        await change_dungeon_tickets_t1(gid, uid, +1)
         return await inter.followup.send("Couldn't create the dungeon channel (ticket refunded).")
 
-    # Register game (track origin_cid for announcements later)
+    # Register game
     dungeon_games[ch.id] = {
         "guild_id": gid,
         "channel_id": ch.id,
@@ -2935,17 +4182,22 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         "state": "await_start",
         "answer": None, "guesses": [], "max": _dungeon_max_for_tier(t), "legend": {}, "pool": 0,
         "gate_msg_id": None, "welcome_msg_id": None, "decision_msg_id": None,
-        "origin_cid": inter.channel.id,  # <— used by _announce_result at the end
-        "solved_words": [],              # <— NEW: keep a history of solved words
+        "origin_cid": inter.channel.id,
+        "solved_words": [],
     }
 
-    # Gate message in current channel (to join)
-    join_msg = await inter.channel.send(
-        f"{EMO_DUNGEON()} **Dungeon Gate (Tier {t}) opened by {inter.user.mention}!**\n"
-        f"Click {EMO_DUNGEON()} below **to join**. You’ll gain write access in {ch.mention}.\n"
-        f"When ready, the owner will **lock** the dungeon from inside to start the game.",
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+    # Gate message in current channel (boxed) with dynamic participants list
+    part_txt = f"<@{uid}> (owner)"
+    gate_embed = make_panel(
+        title=f"{EMO_DUNGEON()} Dungeon Gate (Tier {t})",
+        description=(
+            f"Click {EMO_DUNGEON()} below **to join**. You’ll gain write access in {ch.mention}.\n"
+            f"When ready, the **owner** will **lock** the dungeon from inside to start the game."
+        ),
+        fields=[("Participants", part_txt, False)],
+        icon="🌀",
     )
+    join_msg = await inter.channel.send(embed=gate_embed)
     try:
         await join_msg.add_reaction(EMO_DUNGEON())
     except Exception:
@@ -2962,7 +4214,7 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         "state": "gate_open",
     }
 
-    # Spooky welcome in dungeon channel with lock control
+    # Spooky welcome in dungeon channel (boxed) with lock control
     welcome_txt = (
         "🕯️ **Welcome, adventurers…**\n"
         "The air is cold and the walls whisper letters you cannot see.\n"
@@ -2970,17 +4222,31 @@ async def worldle_dungeon_open(inter: discord.Interaction, tier: app_commands.Ch
         f"**Tier {t}**: rewards multiplier ×{_dungeon_mult_for_tier(t)}, tries **{_dungeon_max_for_tier(t)}** per Wordle.\n"
         "When everyone has joined, the **owner** must click **🔒** below to seal the gate and begin."
     )
-    welcome = await ch.send(
-        f"🌀 **Dungeon — Tier {t}**\nParticipants: <@{uid}> (owner)\n\n{welcome_txt}",
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False)
+    welcome = await send_boxed(
+        ch,
+        f"Dungeon — Tier {t}",
+        f"Participants: <@{uid}> (owner)\n\n{welcome_txt}",
+        icon="🌀",
     )
+    # welcome is a Message returned by send_boxed via safe_send path; get id:
     try:
-        await welcome.add_reaction("🔒")
+        # Retrieve the actual message to add reaction
+        if isinstance(welcome, discord.Message):
+            welcome_msg = welcome
+        else:
+            welcome_msg = await ch.fetch_message(ch.last_message_id)
     except Exception:
-        pass
+        welcome_msg = None
+
+    if welcome_msg:
+        try:
+            await welcome_msg.add_reaction("🔒")
+        except Exception:
+            pass
+
+        dungeon_games[ch.id]["welcome_msg_id"] = welcome_msg.id
 
     dungeon_games[ch.id]["gate_msg_id"] = join_msg.id
-    dungeon_games[ch.id]["welcome_msg_id"] = welcome.id
 
     await inter.followup.send(f"Opened {ch.mention} and posted a **join gate** here. Players must react {EMO_DUNGEON()} to join.")
 
@@ -3165,17 +4431,26 @@ SHOP_ITEMS = {
 SHOP_ORDER = ["stone", "badge", "chicken", "sniper", "ticket_t3"]
 
 
+
 @tree.command(name="shop", description="Show the shop.")
 async def shop(inter: discord.Interaction):
     if not await guard_worldler_inter(inter):
         return
-    lines = ["🛒 **Shop** — buy with `/buy` or sell with `/sell`", ""]
-    for key in SHOP_ORDER:
-        item = SHOP_ITEMS[key]
-        price = item["price"]
-        lines.append(f"• **{item['label']}** — {price} {EMO_SHEKEL()}{'' if price==1 else 's'}\n  _{item['desc']}_")
-    lines.append("\nExamples: `/buy item: Stone amount: 3`, `/sell item: Stone amount: 2`")
-    await send_boxed(inter, "Shop", "\n".join(lines), icon="🛒")
+
+    emb = await _build_shop_embed(inter.guild.id, inter.user.id)
+    view = ShopView(inter)
+    await inter.response.send_message(embed=emb, view=view)
+
+    try:
+        msg = await inter.original_response()
+        view.message = msg
+    except Exception:
+        pass
+
+
+
+
+
 
 
 
@@ -3183,72 +4458,14 @@ async def shop(inter: discord.Interaction):
 @app_commands.describe(item="Item", amount="How many")
 @app_commands.choices(item=[app_commands.Choice(name=SHOP_ITEMS[k]["label"], value=k) for k in SHOP_ORDER])
 async def buy(inter: discord.Interaction, item: app_commands.Choice[str], amount: int):
-    if not await guard_worldler_inter(inter): 
+    if not await guard_worldler_inter(inter):
         return
-    if not inter.guild: 
-        return await inter.response.send_message("Server only.", ephemeral=True)
-    if amount <= 0: 
-        return await inter.response.send_message("Amount must be positive.", ephemeral=True)
+    await _shop_perform_buy(inter, item.value, amount)
 
-    key, gid, uid, cid = item.value, inter.guild.id, inter.user.id, inter.channel_id
-    price = SHOP_ITEMS[key]["price"]
-    cost = price * amount
-    bal = await get_balance(gid, uid)
-    if bal < cost:
-        return await inter.response.send_message(
-            f"Not enough shekels. Cost **{cost} {EMO_SHEKEL()}**, you have **{bal}**.", ephemeral=True
-        )
 
-    if key == "stone":
-        await change_balance(gid, uid, -cost, announce_channel_id=cid)
-        await change_stones(gid, uid, amount)
-        stones = await get_stones(gid, uid)
-        return await inter.response.send_message(
-            f"{EMO_STONE()} Bought **{amount} Stone(s)** (−{cost}). Stones: **{stones}**. Balance: **{await get_balance(gid, uid)}**"
-        )
 
-    if key == "badge":
-        if await get_badge(gid, uid) >= 1:
-            return await inter.response.send_message("You already own the badge.", ephemeral=True)
-        await change_balance(gid, uid, -cost, announce_channel_id=cid)
-        await set_badge(gid, uid, 1)
-        rid = await ensure_bounty_role(inter.guild)
-        try:
-            m = inter.guild.get_member(uid) or await inter.guild.fetch_member(uid)
-            if rid and bot_can_manage_role(inter.guild, inter.guild.get_role(rid)):
-                await m.add_roles(inter.guild.get_role(rid), reason="Bought Bounty Hunter Badge")
-        except Exception as e:
-            log.warning(f"add bounty role failed: {e}")
-        return await inter.response.send_message(
-            f"{EMO_BADGE()} You bought the **Bounty Hunter Badge** (−{cost}). You now receive bounty pings."
-        )
 
-    if key == "chicken":
-        await change_balance(gid, uid, -cost, announce_channel_id=cid)
-        await change_chickens(gid, uid, amount)
-        return await inter.response.send_message(
-            f"{EMO_CHICKEN()} Bought **{amount} Fried Chicken** (−{cost}). You have **{await get_chickens(gid, uid)}**."
-        )
 
-    if key == "sniper":
-        if await get_sniper(gid, uid) >= 1:
-            return await inter.response.send_message("You already own the Sniper.", ephemeral=True)
-        await change_balance(gid, uid, -cost, announce_channel_id=cid)
-        await set_sniper(gid, uid, 1)
-        return await inter.response.send_message(
-            f"{EMO_SNIPER()} You bought the **Sniper** (−{cost}). You can now use `/snipe` (costs {SNIPER_SNIPE_COST} per shot)."
-        )
-
-    if key == "ticket_t3":
-        # Dungeon Ticket (Tier 3) — purchasable
-        await change_balance(gid, uid, -cost, announce_channel_id=cid)
-        await change_dungeon_tickets_t3(gid, uid, amount)
-        count = await get_dungeon_tickets_t3(gid, uid)
-        return await inter.response.send_message(
-            f"{EMO_DUNGEON()} Bought **{amount} Tier-3 Dungeon Ticket(s)** (−{cost}). You now have **{count}**."
-        )
-
-    await inter.response.send_message("This item isn't wired yet.", ephemeral=True)
 
 
 @tree.command(name="sell", description="Sell items back to the shop for the same price.")
@@ -3258,79 +4475,24 @@ async def buy(inter: discord.Interaction, item: app_commands.Choice[str], amount
     app_commands.Choice(name="Bounty Hunter Badge", value="badge"),
     app_commands.Choice(name="Fried Chicken", value="chicken"),
     app_commands.Choice(name="Sniper", value="sniper"),
-    app_commands.Choice(name="Dungeon Ticket (Tier 3)", value="ticket_t3"),  # NEW
+    app_commands.Choice(name="Dungeon Ticket (Tier 3)", value="ticket_t3"),
 ])
-async def sell(inter: discord.Interaction, item: app_commands.Choice[str], amount: int=1):
-    if not await guard_worldler_inter(inter): 
+async def sell(inter: discord.Interaction, item: app_commands.Choice[str], amount: int = 1):
+    if not await guard_worldler_inter(inter):
         return
-    if not inter.guild: 
-        return await inter.response.send_message("Server only.", ephemeral=True)
-    if amount <= 0: 
-        return await inter.response.send_message("Amount must be positive.", ephemeral=True)
-    key, gid, uid, cid = item.value, inter.guild.id, inter.user.id, inter.channel_id
+    if not inter.guild:
+        return await send_boxed(inter, "Shop — Sell", "Server only.", icon="🛍️", ephemeral=False)
+    if amount <= 0:
+        return await send_boxed(inter, "Shop — Sell", "Amount must be positive.", icon="🛍️", ephemeral=False)
 
-    if key == "stone":
-        have = await get_stones(gid, uid)
-        if have < amount: 
-            return await inter.response.send_message("You don't have that many stones.", ephemeral=True)
-        await change_stones(gid, uid, -amount)
-        await change_balance(gid, uid, PRICE_STONE * amount, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **{amount}** {EMO_STONE()} for **{PRICE_STONE*amount} {EMO_SHEKEL()}**."
-        )
+    # Public reply (not ephemeral)
+    try:
+        await inter.response.defer(thinking=False)
+    except Exception:
+        pass
 
-    if key == "badge":
-        have = await get_badge(gid, uid)
-        if have < 1: 
-            return await inter.response.send_message("You don't own the badge.", ephemeral=True)
-        await set_badge(gid, uid, 0)
-        await change_balance(gid, uid, PRICE_BADGE, announce_channel_id=cid)
-        rid = (await get_cfg(gid))["bounty_role_id"]
-        try:
-            m = inter.guild.get_member(uid) or await inter.guild.fetch_member(uid)
-            r = inter.guild.get_role(rid) if rid else None
-            if r and bot_can_manage_role(inter.guild, r):
-                await m.remove_roles(r, reason="Sold Bounty Hunter Badge")
-        except Exception as e:
-            log.warning(f"remove bounty role failed: {e}")
-        return await inter.response.send_message(
-            f"Sold **Bounty Hunter Badge** for **{PRICE_BADGE} {EMO_SHEKEL()}** and lost the role."
-        )
+    await _shop_perform_sell(inter, item.value, amount)
 
-    if key == "chicken":
-        have = await get_chickens(gid, uid)
-        if have < amount: 
-            return await inter.response.send_message("You don't have that many fried chicken.", ephemeral=True)
-        await change_chickens(gid, uid, -amount)
-        await change_balance(gid, uid, PRICE_CHICK * amount, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **{amount}** {EMO_CHICKEN()} for **{PRICE_CHICK*amount} {EMO_SHEKEL()}**."
-        )
-
-    if key == "sniper":
-        have = await get_sniper(gid, uid)
-        if have < 1:
-            return await inter.response.send_message("You don't own the Sniper.", ephemeral=True)
-        if amount != 1:
-            return await inter.response.send_message("You can only sell one Sniper.", ephemeral=True)
-        await set_sniper(gid, uid, 0)
-        await change_balance(gid, uid, PRICE_SNIPER, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **Sniper** for **{PRICE_SNIPER} {EMO_SHEKEL()}**. You no longer have access to `/snipe`."
-        )
-
-    if key == "ticket_t3":
-        have = await get_dungeon_tickets_t3(gid, uid)
-        if have < amount:
-            return await inter.response.send_message("You don't have that many Tier-3 tickets.", ephemeral=True)
-        await change_dungeon_tickets_t3(gid, uid, -amount)
-        refund = 5 * amount
-        await change_balance(gid, uid, refund, announce_channel_id=cid)
-        return await inter.response.send_message(
-            f"Sold **{amount}** {EMO_DUNGEON()} Tier-3 Dungeon Ticket(s) for **{refund} {EMO_SHEKEL()}**."
-        )
-
-    await inter.response.send_message("Can't sell that.", ephemeral=True)
 
 
 @tree.command(name="eat", description="Eat a Fried Chicken to gain 1 hour stone immunity.")
