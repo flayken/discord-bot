@@ -33,6 +33,7 @@ EMO_BOUNTY_NAME  = os.getenv("WW_BOUNTY_NAME",  "ww_bounty")
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
+INTENTS.members = True  # Requires "Server Members Intent" in the developer portal
 bot = discord.Client(intents=INTENTS)
 tree = app_commands.CommandTree(bot)
 
@@ -1497,8 +1498,14 @@ async def is_worldler(guild: discord.Guild, member: discord.abc.User) -> bool:
     if not rid:
         return False
     try:
-        m = guild.get_member(member.id) or await guild.fetch_member(member.id)
-        return any(r.id == rid for r in m.roles)
+        if isinstance(member, discord.Member):
+            roles = member.roles
+        else:
+            m = guild.get_member(member.id)
+            if m is None:
+                m = await guild.fetch_member(member.id)
+            roles = m.roles
+        return any(r.id == rid for r in roles)
     except Exception:
         return False
 
@@ -5147,9 +5154,12 @@ async def immigrate(inter: discord.Interaction):
     if not rid:
         return await inter.response.send_message("I need **Manage Roles** to create the role. Ask an admin.", ephemeral=True)
     role = guild.get_role(rid)
-    if role in (guild.get_member(member.id) or await guild.fetch_member(member.id)).roles:
+    if await is_worldler(guild, member):
         bal = await get_balance(guild.id, member.id)
-        return await inter.response.send_message(f"You're already a **{WORLDLER_ROLE_NAME}**! Balance: **{bal}**.", ephemeral=True)
+        return await inter.response.send_message(
+            f"You're already a **{WORLDLER_ROLE_NAME}**! Balance: **{bal}**.",
+            ephemeral=True,
+        )
 
     try:
         await member.add_roles(role, reason="Wordle World immigration")
@@ -5259,10 +5269,11 @@ async def worldle_end(inter: discord.Interaction):
         definition = await fetch_definition(ans_raw)
 
         await inter.response.send_message(board)
-        await inter.followup.send(
-            f"🛑 Ended your **Word Pot** game. The word was **{ans}** — {quip}{f'\\n📖 Definition: {definition}' if definition else ''}\n"
-            f"Pot is now **{new_pot} {EMO_SHEKEL()}**."
-        )
+        msg = f"🛑 Ended your **Word Pot** game. The word was **{ans}** — {quip}"
+        if definition:
+            msg += f"\n📖 Definition: {definition}"
+        msg += f"\nPot is now **{new_pot} {EMO_SHEKEL()}**."
+        await inter.followup.send(msg)
 
         fields = [("Board", board, False), ("Pot", f"Now **{new_pot} {EMO_SHEKEL()}**", True)]
         if definition:
@@ -5300,7 +5311,10 @@ async def worldle_end(inter: discord.Interaction):
     definition = await fetch_definition(ans_raw)
 
     await inter.response.send_message(board)
-    await inter.followup.send(f"🛑 Ended your game. The word was **{ans}** — {quip}{f'\\n📖 Definition: {definition}' if definition else ''}")
+    msg = f"🛑 Ended your game. The word was **{ans}** — {quip}"
+    if definition:
+        msg += f"\n📖 Definition: {definition}"
+    await inter.followup.send(msg)
 
     fields = [("Board", board, False)]
     if definition:
