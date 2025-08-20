@@ -410,6 +410,19 @@ async def db_init():
         guild_id INTEGER NOT NULL PRIMARY KEY,
         pot INTEGER NOT NULL DEFAULT 10)""")
 
+
+    # Track Word Pot plays per hour
+    await bot.db.execute(
+        """CREATE TABLE IF NOT EXISTS casino_attempts(
+            guild_id INTEGER NOT NULL,
+            user_id  INTEGER NOT NULL,
+            hour_idx INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(guild_id, user_id, hour_idx)
+        )"""
+    )
+
+
     # Anti-bully per-day stones
     await bot.db.execute("""CREATE TABLE IF NOT EXISTS stone_daily(
         guild_id INTEGER NOT NULL,
@@ -1319,6 +1332,29 @@ async def set_casino_pot(gid: int, pot_val: int):
         log.warning(f"[dailies] pot refresh failed for guild {gid}: {e}")
 
 
+# NEW: Word Pot attempt limit helpers
+async def get_word_pot_attempts(gid: int, uid: int, hour_idx: int) -> int:
+    async with bot.db.execute(
+        "SELECT attempts FROM casino_attempts WHERE guild_id=? AND user_id=? AND hour_idx=?",
+        (gid, uid, hour_idx),
+    ) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+async def inc_word_pot_attempts(gid: int, uid: int, hour_idx: int):
+    await bot.db.execute(
+        """
+        INSERT INTO casino_attempts(guild_id, user_id, hour_idx, attempts)
+        VALUES(?,?,?,1)
+        ON CONFLICT(guild_id, user_id, hour_idx)
+        DO UPDATE SET attempts = casino_attempts.attempts + 1
+        """,
+        (gid, uid, hour_idx),
+    )
+    await bot.db.commit()
+
+  
+
 # ------- streak helpers -------
 async def _get_streak(gid: int, uid: int):
     async with bot.db.execute("SELECT last_date,cur,best FROM solo_streak WHERE guild_id=? AND user_id=?", (gid, uid)) as cur:
@@ -1991,32 +2027,54 @@ async def solo_guess(channel: discord.TextChannel, user: discord.Member, word: s
 
 
 # -------------------- CASINO: Word Pot (new) --------------------
-async def casino_start_word_pot(invocation_channel: discord.TextChannel, user: discord.Member) -> Optional[discord.TextChannel]:
+async def casino_start_word_pot(
+    invocation_channel: discord.TextChannel,
+    user: discord.Member
+) -> Optional[discord.TextChannel]:
     gid, uid = invocation_channel.guild.id, user.id
 
     bal = await get_balance(gid, uid)
     if bal < 1:
-        await send_boxed(invocation_channel, "Word Pot", f"{user.mention} you need **1 {EMO_SHEKEL()}** to play.", icon="🎰")
+        await send_boxed(invocation_channel, "Word Pot",
+                         f"{user.mention} you need **1 {EMO_SHEKEL()}** to play.",
+                         icon="🎰")
         return None
 
     existing_cid = casino_channels.get((gid, uid))
     if existing_cid and _key(gid, existing_cid, uid) in casino_games:
         ch = invocation_channel.guild.get_channel(existing_cid)
         if isinstance(ch, discord.TextChannel):
-            await send_boxed(invocation_channel, "Word Pot", f"{user.mention} you already have a game running: {ch.mention}", icon="🎰")
+            await send_boxed(invocation_channel, "Word Pot",
+                             f"{user.mention} you already have a game running: {ch.mention}",
+                             icon="🎰")
             return ch
         else:
             casino_channels.pop((gid, uid), None)
+
+    hour_idx = current_hour_index_gmt()
+    attempts = await get_word_pot_attempts(gid, uid, hour_idx)
+    if attempts >= 5:
+        await send_boxed(invocation_channel, "Word Pot",
+                         f"{user.mention} you have reached the **5 plays/hour** limit.",
+                         icon="🎰")
+        return None
 
     ch = await _make_private_solo_channel(invocation_channel, user)
     if not ch:
         return None
 
+    await inc_word_pot_attempts(gid, uid, hour_idx)
+
     # charge entry
     await change_balance(gid, uid, -1, announce_channel_id=ch.id)
 
     casino_games[_key(gid, ch.id, uid)] = {
-        "answer": random.choice(ANSWERS), "guesses": [], "max": 3, "legend": {}, "origin_cid": invocation_channel.id, "staked": 1
+        "answer": random.choice(ANSWERS),
+        "guesses": [],
+        "max": 3,
+        "legend": {},
+        "origin_cid": invocation_channel.id,
+        "staked": 1,
     }
     casino_channels[(gid, uid)] = ch.id
 
@@ -2035,6 +2093,7 @@ async def casino_start_word_pot(invocation_channel: discord.TextChannel, user: d
     board = render_board(casino_games[_key(gid, ch.id, uid)]["guesses"], total_rows=3)
     await ch.send(board)  # board as plain text
     return ch
+
 
 
 async def casino_guess(channel: discord.TextChannel, user: discord.Member, word: str):
